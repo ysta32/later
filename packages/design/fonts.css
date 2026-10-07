@@ -1,0 +1,31 @@
+/* Marginalia — font loading.
+ * Requires (install in the consuming app):
+ *   @fontsource-variable/literata          (OFL-1.1)  reading serif, opsz + wght axes
+ *   @fontsource-variable/instrument-sans   (OFL-1.1)  UI sans, wdth + wght axes
+ *   @fontsource-variable/jetbrains-mono    (OFL-1.1)  mono
+ * The opsz/wdth entry points include the extra axes; Fontsource sets font-display: swap.
+ */
+@import "@fontsource-variable/literata/opsz.css";
+@import "@fontsource-variable/literata/opsz-italic.css";
+@import "@fontsource-variable/instrument-sans/wdth.css";
+@import "@fontsource-variable/instrument-sans/wdth-italic.css";
+@import "@fontsource-variable/jetbrains-mono/wght.css";
+
+/* Metric-matched fallbacks to keep CLS at 0 while webfonts swap in.
+ * Values are starting points; re-derive with `fontaine`/capsize once fonts are installed. */
+@font-face {
+  font-family: "Literata Fallback";
+  src: local("Georgia"), local("Times New Roman");
+  size-adjust: 103%;
+  ascent-override: 92%;
+  descent-override: 25%;
+  line-gap-override: 0%;
+}
+@font-face {
+  font-family: "Instrument Fallback";
+  src: local("Arial"), local("Helvetica Neue"), local("Helvetica");
+  size-adjust: 96%;
+  ascent-override: 98%;
+  descent-override: 26%;
+  line-gap-override: 0%;
+}
