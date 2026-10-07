@@ -167,3 +167,7 @@ offset 0.18em, turning fully accent on hover. Footnotes: superscript in UI sans,
 ## 10. QA bar
 Screenshots at 375/768/1280/1920 × light/dark (+ sepia for the reader), judged against this file. Lighthouse ≥95 (site). Fonts: preload Literata
 opsz woff2 latin only, `font-display: swap` with metric fallbacks, so CLS stays 0. Every surface: keyboard-only pass, VoiceOver pass and reduced-motion pass.
+
+## Progress log
+- 2026-10-07 17:50 — Direction set: "Marginalia" (warm paper, ink, one proofreader's red pencil). Literata / Instrument Sans / JetBrains Mono. Tokens in packages/design.
+- 2026-10-07 17:55 — "Before" screenshots of the v0 site captured in docs/screenshots/before/site (functional, pre-design-system).

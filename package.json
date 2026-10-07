@@ -23,6 +23,7 @@
     "@types/papaparse": "^5.5.2",
     "@types/sanitize-html": "^2.16.2",
     "@types/turndown": "^5.0.6",
+    "playwright": "^1.64.0",
     "prettier": "^3.9.9",
     "typescript": "^5.9.3",
     "vitest": "^3.2.7"
