@@ -12,8 +12,11 @@ for (const scheme of ["light", "dark"]) {
   const ctx = await browser.newContext({ colorScheme: scheme, deviceScaleFactor: 1 });
   const page = await ctx.newPage();
   if (auth) {
-    const r = await page.request.post(base + "/api/auth/login", { data: { email: auth[0], password: auth[1] } });
-    if (!r.ok()) await page.request.post(base + "/api/auth/signup", { data: { email: auth[0], password: auth[1] } });
+    const r = await page.request.post(base + "/api/auth/login", {
+      data: { email: auth[0], password: auth[1] },
+    });
+    if (!r.ok())
+      await page.request.post(base + "/api/auth/signup", { data: { email: auth[0], password: auth[1] } });
   }
   for (const p of pathsArg.split(",")) {
     for (const w of widths) {

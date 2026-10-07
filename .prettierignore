@@ -4,3 +4,5 @@ dist
 package-lock.json
 apps/site/public
 apps/*/package.json
+**/fixtures/**
+docs/screenshots
