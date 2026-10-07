@@ -685,16 +685,54 @@ export class Repo {
       .run(nowIso(), articleId, userId);
   }
 
-  /** Full articles (with content) updated strictly after `since` (ISO), oldest first; all when since is null. */
-  articlesUpdatedSince(userId: string, since: string | null): Article[] {
+  /**
+   * Full articles (with content) after a sync position, ordered by (updated_at, id). With `id` null
+   * the position is a plain timestamp (strictly after); otherwise ties at the same updated_at are
+   * resolved by id so paging never skips or repeats rows.
+   */
+  articlesUpdatedSince(
+    userId: string,
+    after: { updatedAt: string; id: string | null } | null,
+    limit: number,
+  ): { items: Article[]; more: boolean } {
+    const n = Math.min(Math.max(Math.trunc(limit) || 1, 1), 1000);
     const rows = (
-      since
+      after === null
         ? this.db
-            .prepare("SELECT * FROM articles WHERE user_id = ? AND updated_at > ? ORDER BY updated_at, id")
-            .all(userId, since)
-        : this.db.prepare("SELECT * FROM articles WHERE user_id = ? ORDER BY updated_at, id").all(userId)
+            .prepare("SELECT * FROM articles WHERE user_id = ? ORDER BY updated_at, id LIMIT ?")
+            .all(userId, n + 1)
+        : after.id === null
+          ? this.db
+              .prepare(
+                "SELECT * FROM articles WHERE user_id = ? AND updated_at > ? ORDER BY updated_at, id LIMIT ?",
+              )
+              .all(userId, after.updatedAt, n + 1)
+          : this.db
+              .prepare(
+                `SELECT * FROM articles WHERE user_id = ? AND (updated_at > ? OR (updated_at = ? AND id > ?))
+                 ORDER BY updated_at, id LIMIT ?`,
+              )
+              .all(userId, after.updatedAt, after.updatedAt, after.id, n + 1)
     ) as Row[];
-    return this.hydrate(rows);
+    const more = rows.length > n;
+    return { items: this.hydrate(more ? rows.slice(0, n) : rows), more };
+  }
+
+  countPending(userId: string): number {
+    const r = this.db
+      .prepare("SELECT COUNT(*) AS n FROM articles WHERE user_id = ? AND capture_status = 'pending'")
+      .get(userId) as Row;
+    return Number(r.n);
+  }
+
+  /** All articles awaiting background capture (any user), oldest first. */
+  listPending(): { userId: string; id: string; url: string }[] {
+    const rows = this.db
+      .prepare(
+        "SELECT user_id, id, url FROM articles WHERE capture_status = 'pending' AND url <> '' ORDER BY saved_at, id",
+      )
+      .all() as Row[];
+    return rows.map((r) => ({ userId: str(r.user_id), id: str(r.id), url: str(r.url) }));
   }
 
   // ---------- feeds ----------
@@ -743,6 +781,18 @@ export class Repo {
          WHERE id = ? AND user_id = ?`,
       )
       .run(nowIso(), p.error, (p.title ?? "").slice(0, 500), id, userId);
+  }
+
+  isFeedSeen(feedId: string, guid: string): boolean {
+    return (
+      this.db.prepare("SELECT 1 FROM feed_seen WHERE feed_id = ? AND guid = ?").get(feedId, guid) !==
+      undefined
+    );
+  }
+
+  countFeeds(userId: string): number {
+    const r = this.db.prepare("SELECT COUNT(*) AS n FROM feeds WHERE user_id = ?").get(userId) as Row;
+    return Number(r.n);
   }
 
   /** Atomically claim a feed item guid; true if it was not seen before. */

@@ -2,10 +2,11 @@ import { createHash, timingSafeEqual } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { Hono, type Context } from "hono";
 import { getCookie } from "hono/cookie";
+import { bodyLimit } from "hono/body-limit";
 import { HTTPException } from "hono/http-exception";
 import type { Article, CaptureSource, Extracted } from "@later/core";
 import { parseInbound } from "@later/core/email";
-import { badRequest, readJson, type AppDeps, type AppEnv } from "../app.ts";
+import { assertSameOrigin, badRequest, readJson, type AppDeps, type AppEnv } from "../app.ts";
 import { SESSION_COOKIE } from "../auth.ts";
 import type { Repo } from "../repo.ts";
 import { normalizeUrl } from "./articles.ts";
@@ -109,6 +110,47 @@ async function readInbound(c: Context<AppEnv>) {
   };
 }
 
+/** Share-form CSRF token: derived from (and only valid with) the caller's session token. */
+export function shareCsrf(sessionToken: string): string {
+  return createHash("sha256").update(`later-share-csrf:${sessionToken}`, "utf8").digest("base64url");
+}
+
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+const SHARE_PAGE_HEADERS = {
+  "Cache-Control": "no-store",
+  "X-Frame-Options": "DENY",
+  "Content-Security-Policy":
+    "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'",
+  "Referrer-Policy": "no-referrer",
+};
+
+function sharePage(url: string | null, title: string, csrf: string): string {
+  const body = url
+    ? `<h1>Save to Later?</h1>
+<p class="t">${escapeHtml(title || url)}</p><p class="u">${escapeHtml(url)}</p>
+<form method="post" action="/share">
+<input type="hidden" name="url" value="${escapeHtml(url)}">
+<input type="hidden" name="title" value="${escapeHtml(title)}">
+<input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
+<button type="submit" autofocus>Save</button> <a href="/#/">Cancel</a>
+</form>`
+    : `<h1>Nothing to save</h1><p>No http(s) link was shared.</p><p><a href="/#/">Back to Later</a></p>`;
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>Save to Later</title>
+<style>body{font:16px/1.5 system-ui,sans-serif;max-width:32rem;margin:3rem auto;padding:0 1rem;color:#222}
+.u{color:#666;word-break:break-all;font-size:.9em}button{font:inherit;padding:.5rem 1.25rem;border-radius:.4rem;border:0;background:#222;color:#fff}
+@media (prefers-color-scheme:dark){body{background:#111;color:#eee}button{background:#eee;color:#111}.u{color:#aaa}}</style>
+</head><body>${body}</body></html>`;
+}
+
 const MINIMAL_BOOKMARKLET = `(function () {
   var s = document.currentScript;
   if (!s || !s.src) return;
@@ -144,26 +186,54 @@ export function shareRoutes(): Hono<AppEnv> {
     });
   });
 
-  r.get("/share", async (c) => {
-    const q = c.req.query();
-    const repo = c.get("repo");
+  /** Resolve the cookie-session user, or null. */
+  const cookieUser = (c: Context<AppEnv>) => {
     const token = getCookie(c, SESSION_COOKIE);
-    const user = token ? repo.userForToken(token) : null;
-    if (!user) {
-      const next = new URL(c.req.url);
-      return c.redirect(`/#/login?next=${encodeURIComponent(next.pathname + next.search)}`, 303);
-    }
-    // A GET that saves with cookie auth: refuse cross-site initiated requests (CSRF). A share-sheet
-    // launch is a user navigation (Sec-Fetch-Site: none); old browsers send no header at all.
-    const site = c.req.header("sec-fetch-site");
-    if (site !== undefined && site !== "same-origin" && site !== "none")
-      return c.text("Cross-site share requests are not allowed", 403);
+    const user = token ? c.get("repo").userForToken(token) : null;
+    return user && token ? { user, token } : null;
+  };
+  const loginRedirect = (c: Context<AppEnv>) => {
+    const next = new URL(c.req.url);
+    return c.redirect(`/#/login?next=${encodeURIComponent(next.pathname + next.search)}`, 303);
+  };
+
+  // GET never mutates: it renders a confirm page whose same-origin POST (carrying a CSRF token
+  // bound to the session) performs the save. The page refuses framing (no clickjacking).
+  r.get("/share", (c) => {
+    const q = c.req.query();
+    const auth = cookieUser(c);
+    if (!auth) return loginRedirect(c);
     const url = normalizeUrl(q.url) ?? firstUrl(q.text ?? "") ?? firstUrl(q.title ?? "") ?? null;
-    if (!url) return c.text("Nothing to save: no http(s) URL was shared", 400);
-    const title = (q.title ?? "").trim().slice(0, 1000) || null;
-    const { article } = await saveByUrl(repo, c.get("deps"), user.id, url, "share", title);
-    return c.redirect(`/#/saved/${encodeURIComponent(article.id)}`, 303);
+    const title = (q.title ?? "").trim().slice(0, 1000);
+    return c.html(sharePage(url, title, shareCsrf(auth.token)), url ? 200 : 400, SHARE_PAGE_HEADERS);
   });
+
+  r.post(
+    "/share",
+    bodyLimit({ maxSize: 64 * 1024, onError: (c) => c.text("Request body too large", 413) }),
+    async (c) => {
+      const auth = cookieUser(c);
+      if (!auth) return loginRedirect(c);
+      assertSameOrigin(c, false);
+      const ct = (c.req.header("content-type") ?? "").split(";")[0].trim().toLowerCase();
+      if (ct !== "application/x-www-form-urlencoded" && ct !== "multipart/form-data")
+        throw new HTTPException(415, { message: "expected a form post" });
+      let form: Record<string, unknown>;
+      try {
+        form = (await c.req.parseBody()) as Record<string, unknown>;
+      } catch {
+        badRequest("invalid form body");
+      }
+      const csrf = typeof form.csrf === "string" ? form.csrf : "";
+      if (!safeEqual(csrf, shareCsrf(auth.token)))
+        throw new HTTPException(403, { message: "invalid CSRF token" });
+      const url = normalizeUrl(form.url);
+      if (!url) badRequest("a valid http(s) url is required");
+      const title = typeof form.title === "string" ? form.title.trim().slice(0, 1000) || null : null;
+      const { article } = await saveByUrl(c.get("repo"), c.get("deps"), auth.user.id, url, "share", title);
+      return c.redirect(`/#/saved/${encodeURIComponent(article.id)}`, 303);
+    },
+  );
 
   return r;
 }

@@ -7,6 +7,7 @@ import { assertPublicUrl, isPrivateIp, pinnedRequest, type ResolvedAddress } fro
 import { parseFeed } from "@later/core/feeds";
 import { countWords, htmlToText, sanitizeHtml } from "@later/core/sanitize";
 import { badRequest, readJson, requireAuth, type AppDeps, type AppEnv } from "../app.ts";
+import { RateLimiter } from "../auth.ts";
 import type { Repo } from "../repo.ts";
 import { normalizeUrl } from "./articles.ts";
 import { errMessage } from "./channels.ts";
@@ -15,12 +16,39 @@ import { errMessage } from "./channels.ts";
 export type FeedFetcher = (url: string) => Promise<string>;
 
 export const FEED_TIMEOUT_MS = 15_000;
+/** Minimum interval between manual refreshes per user. */
+export const REFRESH_COOLDOWN_MS = 60_000;
 const FEED_MAX_BYTES = 10 * 1024 * 1024;
 const MAX_REDIRECTS = 5;
 /** Feed items whose sanitized text exceeds this many chars are stored as-is (no page fetch). */
 const SUBSTANTIAL_CHARS = 500;
-/** Cap on new items ingested per feed per refresh (older unseen items are marked seen and skipped). */
-const MAX_NEW_PER_REFRESH = 20;
+/** Cap on new items ingested per feed per refresh; further unseen items stay unseen for the next run. */
+export const MAX_NEW_PER_REFRESH = 20;
+/** Max feeds per user. */
+export const MAX_FEEDS_PER_USER = 200;
+/** Max feeds being refreshed at once across the whole process (route + scheduler). */
+export const FEED_REFRESH_CONCURRENCY = 4;
+
+/** Counting semaphore. */
+class Semaphore {
+  private free: number;
+  private waiters: (() => void)[] = [];
+  constructor(n: number) {
+    this.free = n;
+  }
+  async run<T>(fn: () => Promise<T>): Promise<T> {
+    if (this.free > 0) this.free--;
+    else await new Promise<void>((r) => this.waiters.push(r));
+    try {
+      return await fn();
+    } finally {
+      const next = this.waiters.shift();
+      if (next) next();
+      else this.free++;
+    }
+  }
+}
+const refreshSlots = new Semaphore(FEED_REFRESH_CONCURRENCY);
 
 const FEED_ACCEPT =
   "application/rss+xml, application/atom+xml, application/feed+json, application/json;q=0.9, application/xml;q=0.9, text/xml;q=0.8, */*;q=0.5";
@@ -97,8 +125,12 @@ function fetcherFor(deps: AppDeps): FeedFetcher {
   return deps.fetchFeed ?? createFeedFetcher({ allowPrivate: deps.config.allowPrivateFetch === true });
 }
 
-/** Refresh one feed: save unseen items. Returns the number of articles added. */
-export async function refreshFeed(repo: Repo, deps: AppDeps, feed: Feed): Promise<number> {
+/** Refresh one feed (bounded by the process-wide refresh concurrency). Returns articles added. */
+export function refreshFeed(repo: Repo, deps: AppDeps, feed: Feed): Promise<number> {
+  return refreshSlots.run(() => refreshFeedNow(repo, deps, feed));
+}
+
+async function refreshFeedNow(repo: Repo, deps: AppDeps, feed: Feed): Promise<number> {
   let parsed;
   try {
     const xml = await withTimeout(fetcherFor(deps)(feed.url), FEED_TIMEOUT_MS);
@@ -114,9 +146,12 @@ export async function refreshFeed(repo: Repo, deps: AppDeps, feed: Feed): Promis
   for (const item of parsed.items) {
     const guid = (item.guid || item.url || "").slice(0, 2000);
     if (!guid) continue;
+    if (repo.isFeedSeen(feed.id, guid)) continue;
+    // Over the per-run cap: leave the rest unseen so a later refresh picks them up.
+    if (fresh >= MAX_NEW_PER_REFRESH) break;
     // Claim the guid synchronously first so overlapping refreshes never ingest an item twice.
     if (!repo.markFeedSeen(feed.id, guid)) continue;
-    if (++fresh > MAX_NEW_PER_REFRESH) continue;
+    fresh++;
     const url = item.url ? normalizeUrl(item.url) : null;
     if (url && repo.findArticleByUrl(feed.userId, url)) continue;
 
@@ -168,6 +203,9 @@ export async function refreshUserFeeds(repo: Repo, deps: AppDeps, userId: string
 export function feedRoutes(): Hono<AppEnv> {
   const r = new Hono<AppEnv>();
 
+  const addLimiter = new RateLimiter(30, 60 * 60_000);
+  const refreshCooldown = new RateLimiter(1, REFRESH_COOLDOWN_MS);
+
   r.get("/feeds", requireAuth, (c) => c.json({ items: c.get("repo").listFeeds(c.get("user").id) }));
 
   r.post("/feeds", requireAuth, async (c) => {
@@ -178,6 +216,10 @@ export function feedRoutes(): Hono<AppEnv> {
     const userId = c.get("user").id;
     const existing = repo.getFeedByUrl(userId, url);
     if (existing) return c.json(existing, 200);
+    if (repo.countFeeds(userId) >= MAX_FEEDS_PER_USER)
+      badRequest(`feed limit reached (max ${MAX_FEEDS_PER_USER})`);
+    if (!addLimiter.attempt(userId))
+      throw new HTTPException(429, { message: "too many feeds added; try later" });
     let title: string;
     try {
       const xml = await withTimeout(fetcherFor(c.get("deps"))(url), FEED_TIMEOUT_MS);
@@ -201,6 +243,8 @@ export function feedRoutes(): Hono<AppEnv> {
     const userId = c.get("user").id;
     let run = inflight.get(userId);
     if (!run) {
+      if (!refreshCooldown.attempt(userId))
+        throw new HTTPException(429, { message: "feeds were refreshed recently; try again in a minute" });
       run = refreshUserFeeds(c.get("repo"), c.get("deps"), userId).finally(() => inflight.delete(userId));
       inflight.set(userId, run);
     }

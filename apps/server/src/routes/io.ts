@@ -1,50 +1,89 @@
 import { Hono, type Context } from "hono";
 import { HTTPException } from "hono/http-exception";
-import { unzipSync } from "fflate";
+import { Unzip, UnzipInflate } from "fflate";
 import type { Article, ExportBundle, Extracted, ImportFormat, ImportItem } from "@later/core";
 import { detectFormat, parseImport } from "@later/core/importers";
-import { articleToMarkdown, exportJson, markdownZip } from "../../../../packages/core/src/exporters.ts"; // switch to "@later/core/exporters" once t03 lands
-import { buildEpub } from "../../../../packages/core/src/epub.ts"; // switch to "@later/core/epub" once t03 lands
+import { articleToMarkdown, exportJson, markdownZip } from "@later/core/exporters";
+import { buildEpub } from "@later/core/epub";
 import { countWords, htmlToText, sanitizeHtml } from "@later/core/sanitize";
-import { badRequest, requireAuth, type AppEnv } from "../app.ts";
+import { badRequest, requireAuth, type AppEnv, type Extractor } from "../app.ts";
 import { RateLimiter } from "../auth.ts";
 import { createSmtpMailer, defaultMailFrom } from "../mailer.ts";
-import { normalizeTags } from "../repo.ts";
+import { normalizeTags, type Repo } from "../repo.ts";
 import { normalizeUrl } from "./articles.ts";
 import { errMessage } from "./channels.ts";
 
-/** Minimal in-process job queue with bounded concurrency. Job errors are logged, never thrown. */
+type Job = () => Promise<void>;
+
+/**
+ * In-process background job queue: bounded global concurrency, round-robin fairness across keys
+ * (users), and de-duplication by job id (an id queued or running is not enqueued again).
+ * Job errors are logged, never thrown.
+ */
 export class TaskQueue {
   private readonly concurrency: number;
-  private readonly jobs: (() => Promise<void>)[] = [];
+  /** Per-key FIFO; Map insertion order is the round-robin order. */
+  private readonly lanes = new Map<string, { id: string; job: Job }[]>();
+  private readonly ids = new Set<string>();
+  private readonly perKey = new Map<string, number>();
   private running = 0;
   private idle: (() => void)[] = [];
   constructor(concurrency: number) {
     this.concurrency = Math.max(1, concurrency);
   }
+  /** Jobs queued or running. */
   get size(): number {
-    return this.jobs.length + this.running;
+    return this.ids.size;
   }
-  push(job: () => Promise<void>): void {
-    this.jobs.push(job);
+  /** Jobs queued or running for one key. */
+  sizeFor(key: string): number {
+    return this.perKey.get(key) ?? 0;
+  }
+  has(id: string): boolean {
+    return this.ids.has(id);
+  }
+  /** Enqueue; returns false if a job with this id is already queued or running. */
+  push(key: string, id: string, job: Job): boolean {
+    if (this.ids.has(id)) return false;
+    this.ids.add(id);
+    this.perKey.set(key, this.sizeFor(key) + 1);
+    const lane = this.lanes.get(key);
+    if (lane) lane.push({ id, job });
+    else this.lanes.set(key, [{ id, job }]);
     this.pump();
+    return true;
   }
   /** Resolves when no jobs are queued or running. */
   drain(): Promise<void> {
     if (this.size === 0) return Promise.resolve();
     return new Promise((resolve) => this.idle.push(resolve));
   }
+  private next(): { key: string; id: string; job: Job } | null {
+    for (const [key, lane] of this.lanes) {
+      const item = lane.shift() as { id: string; job: Job };
+      // Rotate: this key goes to the back of the round-robin (or leaves when empty).
+      this.lanes.delete(key);
+      if (lane.length) this.lanes.set(key, lane);
+      return { key, ...item };
+    }
+    return null;
+  }
   private pump(): void {
-    while (this.running < this.concurrency && this.jobs.length) {
-      const job = this.jobs.shift() as () => Promise<void>;
+    while (this.running < this.concurrency) {
+      const item = this.next();
+      if (!item) break;
       this.running++;
       void (async () => {
         try {
-          await job();
+          await item.job();
         } catch (err) {
           console.error("[later] background job failed:", err);
         } finally {
           this.running--;
+          this.ids.delete(item.id);
+          const n = this.sizeFor(item.key) - 1;
+          if (n > 0) this.perKey.set(item.key, n);
+          else this.perKey.delete(item.key);
           this.pump();
           if (this.size === 0) for (const r of this.idle.splice(0)) r();
         }
@@ -53,11 +92,83 @@ export class TaskQueue {
   }
 }
 
+/** Fetch+extract one pending imported article in the background (idempotent per article id). */
+export function enqueueCapture(
+  queue: TaskQueue,
+  repo: Repo,
+  extract: Extractor,
+  userId: string,
+  id: string,
+  url: string,
+): boolean {
+  return queue.push(userId, id, async () => {
+    let ex: Extracted | null = null;
+    let error: string | null = null;
+    try {
+      ex = await extract.fetchAndExtract(url);
+    } catch (err) {
+      error = errMessage(err);
+    }
+    repo.replaceContent(userId, id, ex, error);
+  });
+}
+
+/** Re-enqueue every article left "pending" (e.g. by a restart mid-import). Returns how many were queued. */
+export function resumePending(queue: TaskQueue, repo: Repo, extract: Extractor): number {
+  let n = 0;
+  for (const p of repo.listPending()) if (enqueueCapture(queue, repo, extract, p.userId, p.id, p.url)) n++;
+  return n;
+}
+
+/** Max items accepted from one import upload. */
+export const MAX_IMPORT_ITEMS = 5000;
+/** Max articles a user may have waiting for background capture. */
+export const MAX_PENDING_PER_USER = 5000;
+
 const IMPORT_FORMATS: readonly ImportFormat[] = ["pocket", "omnivore", "instapaper", "readwise", "bookmarks"];
-/** Total decompressed bytes we are willing to read out of an uploaded zip. */
-const MAX_UNZIPPED = 200 * 1024 * 1024;
-const DATA_FILE = /\.(json|csv|html?|txt)$/i;
+/** Max decompressed bytes read out of an uploaded zip (measured on actual inflated output). */
+export const MAX_UNZIPPED = 30 * 1024 * 1024;
+/** Max entries (of any kind) in an uploaded zip. */
+export const MAX_ZIP_ENTRIES = 1000;
 const OMNIVORE_META = /(?:^|\/)metadata_[^/]*\.json$/i;
+/** Compressed bytes fed to the inflater per step (bounds a single inflate burst to ~1032x this). */
+const ZIP_STEP = 16 * 1024;
+
+class ZipLimit extends Error {}
+
+/**
+ * Stream-unzip an Omnivore export, decompressing only metadata_*.json entries. Aborts with 413 once
+ * total inflated output exceeds MAX_UNZIPPED or the archive has more than MAX_ZIP_ENTRIES entries.
+ */
+export function unzipOmnivore(bytes: Uint8Array): Map<string, Uint8Array> {
+  const out = new Map<string, Uint8Array>();
+  let total = 0;
+  let entries = 0;
+  const uz = new Unzip();
+  uz.register(UnzipInflate);
+  uz.onfile = (f) => {
+    if (++entries > MAX_ZIP_ENTRIES) throw new ZipLimit(`zip has more than ${MAX_ZIP_ENTRIES} entries`);
+    if (!OMNIVORE_META.test(f.name) || f.name.startsWith("__MACOSX/")) return;
+    const chunks: Uint8Array[] = [];
+    f.ondata = (err, data, final) => {
+      if (err) throw err;
+      total += data.length;
+      if (total > MAX_UNZIPPED) throw new ZipLimit("zip contents too large");
+      chunks.push(data);
+      if (final) out.set(f.name, Buffer.concat(chunks));
+    };
+    f.start();
+  };
+  try {
+    if (bytes.length === 0) uz.push(bytes, true);
+    for (let i = 0; i < bytes.length; i += ZIP_STEP)
+      uz.push(bytes.subarray(i, i + ZIP_STEP), i + ZIP_STEP >= bytes.length);
+  } catch (err) {
+    if (err instanceof ZipLimit) throw new HTTPException(413, { message: err.message });
+    badRequest("invalid zip file");
+  }
+  return out;
+}
 
 function decodeText(bytes: Uint8Array): string {
   return new TextDecoder("utf-8").decode(bytes).replace(/^\uFEFF/, "");
@@ -92,47 +203,25 @@ export function parseUpload(
     const text = decodeText(bytes);
     return parseOrThrow(resolveFormat(requested, filename, text), text);
   }
-  let total = 0;
-  let files: Record<string, Uint8Array>;
-  try {
-    files = unzipSync(bytes, {
-      filter: (f) => {
-        if (!DATA_FILE.test(f.name) || f.name.startsWith("__MACOSX/")) return false;
-        total += f.originalSize;
-        if (total > MAX_UNZIPPED) throw new RangeError("zip contents too large");
-        return true;
-      },
-    });
-  } catch (err) {
-    if (err instanceof RangeError) throw new HTTPException(413, { message: "zip contents too large" });
-    badRequest("invalid zip file");
-  }
-  const names = Object.keys(files).sort();
-  const meta = names.filter((n) => OMNIVORE_META.test(n));
-  if (meta.length && (requested === "auto" || requested === "omnivore")) {
-    // Omnivore export: concatenate the metadata_*.json arrays.
-    const records: unknown[] = [];
-    for (const n of meta) {
-      let arr: unknown;
-      try {
-        arr = JSON.parse(decodeText(files[n]));
-      } catch {
-        badRequest(`invalid JSON in ${n}`);
-      }
-      if (Array.isArray(arr)) records.push(...arr);
+  if (requested !== "auto" && requested !== "omnivore")
+    badRequest(`zip uploads are only supported for omnivore exports`);
+  const files = unzipOmnivore(bytes);
+  if (!files.size) badRequest("zip contains no Omnivore metadata_*.json files");
+  // Omnivore export: concatenate the metadata_*.json arrays.
+  const records: unknown[] = [];
+  for (const n of [...files.keys()].sort()) {
+    let arr: unknown;
+    try {
+      arr = JSON.parse(decodeText(files.get(n) as Uint8Array));
+    } catch {
+      badRequest(`invalid JSON in ${n}`);
     }
-    return parseOrThrow("omnivore", JSON.stringify(records));
+    if (!Array.isArray(arr)) badRequest(`${n} is not a JSON array`);
+    if (records.length + arr.length > MAX_IMPORT_ITEMS)
+      badRequest(`too many items in one import (max ${MAX_IMPORT_ITEMS})`);
+    records.push(...arr);
   }
-  const items: ImportItem[] = [];
-  for (const n of names) {
-    const text = decodeText(files[n]);
-    const format = requested === "auto" ? detectFormat(n, text) : requested;
-    if (!format) continue;
-    items.push(...parseOrThrow(format, text));
-  }
-  if (!items.length && names.length && requested === "auto")
-    badRequest("could not detect import format in zip");
-  return items;
+  return parseOrThrow("omnivore", JSON.stringify(records));
 }
 
 async function readUpload(c: Context<AppEnv>): Promise<{ bytes: Uint8Array; filename: string }> {
@@ -196,6 +285,24 @@ function slug(s: string): string {
   );
 }
 
+/** Max articles per Obsidian sync page. */
+export const SYNC_PAGE = 200;
+
+function encodeSyncCursor(updatedAt: string, id: string): string {
+  return Buffer.from(`${updatedAt}|${id}`, "utf8").toString("base64url");
+}
+
+/** Opaque (updatedAt, id) cursor; null if `s` is not one (e.g. a plain ISO date). */
+function decodeSyncCursor(s: string): { updatedAt: string; id: string } | null {
+  if (!/^[A-Za-z0-9_-]+$/.test(s)) return null;
+  const d = Buffer.from(s, "base64url").toString("utf8");
+  const i = d.lastIndexOf("|");
+  if (i <= 0) return null;
+  const updatedAt = d.slice(0, i);
+  if (Number.isNaN(Date.parse(updatedAt))) return null;
+  return { updatedAt, id: d.slice(i + 1) };
+}
+
 const today = () => new Date().toISOString().slice(0, 10);
 const MAX_EPUB_IDS = 100;
 
@@ -218,11 +325,19 @@ export function ioRoutes(): Hono<AppEnv> {
     const { bytes, filename } = await readUpload(c);
     if (!bytes.length) badRequest("empty upload");
     const items = parseUpload(bytes, filename, fmtRaw as ImportFormat | "auto");
+    if (items.length > MAX_IMPORT_ITEMS) badRequest(`too many items in one import (max ${MAX_IMPORT_ITEMS})`);
 
     const repo = c.get("repo");
     const queue = c.get("queue");
     const extract = c.get("deps").extract;
     const userId = c.get("user").id;
+    // Admission control: bound the background capture backlog per user (counted conservatively:
+    // every item in this upload may become pending).
+    const backlog = Math.max(repo.countPending(userId), queue.sizeFor(userId));
+    if (backlog + items.length > MAX_PENDING_PER_USER)
+      throw new HTTPException(429, {
+        message: `too many articles awaiting capture (${backlog}); try again after they finish`,
+      });
     let imported = 0;
     let skipped = 0;
     let failed = 0;
@@ -261,18 +376,7 @@ export function ioRoutes(): Hono<AppEnv> {
       imported++;
       if (a.captureStatus === "pending") toFetch.push({ id: a.id, url });
     }
-    for (const { id, url } of toFetch) {
-      queue.push(async () => {
-        let ex: Extracted | null = null;
-        let error: string | null = null;
-        try {
-          ex = await extract.fetchAndExtract(url);
-        } catch (err) {
-          error = errMessage(err);
-        }
-        repo.replaceContent(userId, id, ex, error);
-      });
-    }
+    for (const { id, url } of toFetch) enqueueCapture(queue, repo, extract, userId, id, url);
     return c.json({ imported, skipped, failed });
   });
 
@@ -378,22 +482,34 @@ export function ioRoutes(): Hono<AppEnv> {
   });
 
   r.get("/obsidian/sync", requireAuth, (c) => {
-    const sinceRaw = c.req.query("since");
-    let since: string | null = null;
+    // `since` is either an ISO date (strictly-after) or an opaque cursor returned by this endpoint.
+    const sinceRaw = c.req.query("cursor") || c.req.query("since");
+    let after: { updatedAt: string; id: string | null } | null = null;
     if (sinceRaw) {
-      const t = Date.parse(sinceRaw);
-      if (Number.isNaN(t)) badRequest("since must be an ISO date");
-      since = new Date(t).toISOString();
+      const cur = decodeSyncCursor(sinceRaw);
+      if (cur) after = cur;
+      else {
+        const t = Date.parse(sinceRaw);
+        if (Number.isNaN(t)) badRequest("since must be an ISO date or a cursor");
+        after = { updatedAt: new Date(t).toISOString(), id: null };
+      }
     }
+    const limitRaw = c.req.query("limit");
+    const limit = limitRaw ? Number(limitRaw) : SYNC_PAGE;
+    if (!Number.isInteger(limit) || limit < 1) badRequest("limit must be a positive integer");
     const repo = c.get("repo");
     const userId = c.get("user").id;
-    const arts = repo.articlesUpdatedSince(userId, since);
-    let cursor = since;
-    const articles = arts.map((a) => {
-      if (!cursor || a.updatedAt > cursor) cursor = a.updatedAt;
-      return articleToMarkdown(a, repo.listHighlights(userId, a.id));
-    });
-    return c.json({ articles, cursor });
+    const page = repo.articlesUpdatedSince(userId, after, Math.min(limit, SYNC_PAGE));
+    const last = page.items[page.items.length - 1];
+    const cursor = last
+      ? encodeSyncCursor(last.updatedAt, last.id)
+      : after
+        ? after.id === null
+          ? after.updatedAt
+          : encodeSyncCursor(after.updatedAt, after.id)
+        : null;
+    const articles = page.items.map((a) => articleToMarkdown(a, repo.listHighlights(userId, a.id)));
+    return c.json({ articles, cursor, nextCursor: page.more ? cursor : null });
   });
 
   return r;

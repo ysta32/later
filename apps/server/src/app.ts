@@ -13,7 +13,7 @@ import { articleRoutes } from "./routes/articles.ts";
 import { highlightRoutes } from "./routes/highlights.ts";
 import { channelRoutes, shareRoutes } from "./routes/channels.ts";
 import { feedRoutes, type FeedFetcher } from "./routes/feeds.ts";
-import { ioRoutes, TaskQueue } from "./routes/io.ts";
+import { ioRoutes, resumePending, TaskQueue } from "./routes/io.ts";
 import { aiRoutes } from "./routes/ai.ts";
 import type { Mailer } from "./mailer.ts";
 
@@ -220,6 +220,8 @@ const cors: MiddlewareHandler<AppEnv> = async (c, next) => {
 export type LaterApp = Hono<AppEnv> & {
   /** Resolves once all background jobs (e.g. import fetches) have finished. */
   drain(): Promise<void>;
+  /** Re-enqueue articles left "pending" (call once at boot; idempotent). Returns the number queued. */
+  resumePending(): number;
 };
 
 export function createApp(deps: AppDeps): LaterApp {
@@ -265,5 +267,8 @@ export function createApp(deps: AppDeps): LaterApp {
       ? c.json({ error: "not found" }, 404)
       : c.text("Not found", 404),
   );
-  return Object.assign(app, { drain: () => queue.drain() });
+  return Object.assign(app, {
+    drain: () => queue.drain(),
+    resumePending: () => resumePending(queue, repo, deps.extract),
+  });
 }

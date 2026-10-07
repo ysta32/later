@@ -43,6 +43,8 @@ const deps: AppDeps = {
 };
 const app = createApp(deps);
 const stopScheduler = startFeedScheduler(deps, feedIntervalMin);
+const resumed = app.resumePending();
+if (resumed) console.log(`[later] resuming capture of ${resumed} pending article(s)`);
 
 // Static web app (if built), with SPA fallback to index.html for non-/api paths.
 const webDist = fileURLToPath(new URL("../../web/dist", import.meta.url));

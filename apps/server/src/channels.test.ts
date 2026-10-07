@@ -7,8 +7,14 @@ import { createApp, type AppConfig, type AppDeps, type Extractor } from "./app.t
 import { openDb } from "./db.ts";
 import type { Mailer, MailMessage } from "./mailer.ts";
 import { firstUrl, safeEqual } from "./routes/channels.ts";
-import { TaskQueue } from "./routes/io.ts";
-import { createFeedFetcher } from "./routes/feeds.ts";
+import { MAX_UNZIPPED, TaskQueue } from "./routes/io.ts";
+import {
+  createFeedFetcher,
+  MAX_FEEDS_PER_USER,
+  MAX_NEW_PER_REFRESH,
+  refreshUserFeeds,
+} from "./routes/feeds.ts";
+import { Repo } from "./repo.ts";
 
 function extracted(url: string, title: string, text: string): Extracted {
   return {
@@ -173,17 +179,58 @@ describe("share + bookmarklet", () => {
     expect(ex.fetchCalls).toHaveLength(0);
   });
 
-  it("saves the first URL in text and redirects to the article", async () => {
+  it("GET renders a confirm page and never saves; POST with session CSRF token saves", async () => {
     const { token, user } = await signup("a@x.io");
-    const r = await call(
+    const cookie = `later_session=${token}`;
+    const g = await call(
       "GET",
       `/share?text=${encodeURIComponent("look at this: https://a.example/post. wow")}`,
       {
-        headers: { cookie: `later_session=${token}`, "sec-fetch-site": "none" },
+        headers: { cookie },
       },
     );
-    expect(r.status).toBe(303);
-    const loc = r.res.headers.get("location") ?? "";
+    expect(g.status).toBe(200);
+    expect(g.res.headers.get("x-frame-options")).toBe("DENY");
+    expect(g.res.headers.get("content-security-policy")).toMatch(/frame-ancestors 'none'/);
+    const html = new TextDecoder().decode(g.bytes!);
+    expect(html).toContain('method="post" action="/share"');
+    expect(html).toContain('value="https://a.example/post"');
+    expect(html).not.toMatch(/<script/i);
+    const csrf = /name="csrf" value="([^"]+)"/.exec(html)![1];
+    expect(ex.fetchCalls).toHaveLength(0);
+    expect((await call("GET", "/api/articles", { token })).json.items).toHaveLength(0);
+
+    const form = (fields: Record<string, string>) => ({
+      raw: new URLSearchParams(fields).toString(),
+      headers: { cookie, "content-type": "application/x-www-form-urlencoded", origin: ORIGIN },
+    });
+    // Wrong / missing / other-session token.
+    expect((await call("POST", "/share", form({ url: "https://a.example/post", csrf: "nope" }))).status).toBe(
+      403,
+    );
+    expect((await call("POST", "/share", form({ url: "https://a.example/post" }))).status).toBe(403);
+    const other = await signup("b@x.io");
+    const otherHtml = new TextDecoder().decode(
+      (
+        await call("GET", "/share?url=https%3A%2F%2Fa.example%2Fpost", {
+          headers: { cookie: `later_session=${other.token}` },
+        })
+      ).bytes!,
+    );
+    const otherCsrf = /name="csrf" value="([^"]+)"/.exec(otherHtml)![1];
+    expect(otherCsrf).not.toBe(csrf);
+    expect(
+      (await call("POST", "/share", form({ url: "https://a.example/post", csrf: otherCsrf }))).status,
+    ).toBe(403);
+    // Cross-origin post is refused even with the right token.
+    const xo = form({ url: "https://a.example/post", csrf });
+    xo.headers.origin = "https://evil.site";
+    expect((await call("POST", "/share", xo)).status).toBe(403);
+    expect(ex.fetchCalls).toHaveLength(0);
+
+    const p = await call("POST", "/share", form({ url: "https://a.example/post", title: "T", csrf }));
+    expect(p.status).toBe(303);
+    const loc = p.res.headers.get("location") ?? "";
     expect(loc).toMatch(/^\/#\/saved\//);
     const id = decodeURIComponent(loc.slice("/#/saved/".length));
     const a = await call("GET", `/api/articles/${id}`, { token });
@@ -192,13 +239,17 @@ describe("share + bookmarklet", () => {
     expect(a.json.userId).toBe(user.id);
   });
 
-  it("refuses cross-site initiated shares", async () => {
+  it("GET without a URL shows a 400 page; POST signed out redirects to login", async () => {
     const { token } = await signup("a@x.io");
-    const r = await call("GET", "/share?url=https%3A%2F%2Fa.example%2Fp", {
-      headers: { cookie: `later_session=${token}`, "sec-fetch-site": "cross-site" },
+    const g = await call("GET", "/share?text=hello", { headers: { cookie: `later_session=${token}` } });
+    expect(g.status).toBe(400);
+    expect(new TextDecoder().decode(g.bytes!)).not.toContain("<form");
+    const p = await call("POST", "/share", {
+      raw: "url=https%3A%2F%2Fa.example%2Fx&csrf=x",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
     });
-    expect(r.status).toBe(403);
-    expect(ex.fetchCalls).toHaveLength(0);
+    expect(p.status).toBe(303);
+    expect(p.res.headers.get("location")).toMatch(/^\/#\/login\?next=/);
   });
 
   it("serves the bookmarklet script", async () => {
@@ -355,8 +406,11 @@ describe("feeds", () => {
     expect(full.contentHtml).toContain("Inline feed article");
     expect(full.contentHtml).not.toMatch(/<script|evil/);
 
-    const r2 = await call("POST", "/api/feeds/refresh", { token });
-    expect(r2.json.added).toBe(0);
+    // Manual refresh has a per-user cooldown.
+    expect((await call("POST", "/api/feeds/refresh", { token })).status).toBe(429);
+    const repo = new Repo(deps.db);
+    const userId = sub.json.userId as string;
+    expect(await refreshUserFeeds(repo, deps, userId)).toBe(0);
 
     feeds.set(
       "https://f.example/rss",
@@ -365,15 +419,44 @@ describe("feeds", () => {
         { guid: "g1", link: "https://f.example/1", title: "One" },
       ]),
     );
-    expect((await call("POST", "/api/feeds/refresh", { token })).json.added).toBe(1);
+    expect(await refreshUserFeeds(repo, deps, userId)).toBe(1);
 
     feeds.delete("https://f.example/rss");
-    const r4 = await call("POST", "/api/feeds/refresh", { token });
-    expect(r4.json.feeds[0].lastError).toBeTruthy();
+    expect(await refreshUserFeeds(repo, deps, userId)).toBe(0);
+    expect((await call("GET", "/api/feeds", { token })).json.items[0].lastError).toBeTruthy();
 
     const other = await signup("b@x.io");
     expect((await call("DELETE", `/api/feeds/${sub.json.id}`, { token: other.token })).status).toBe(404);
     expect((await call("DELETE", `/api/feeds/${sub.json.id}`, { token })).status).toBe(204);
+  });
+});
+
+describe("feed limits", () => {
+  it("defers unseen items beyond the per-run cap instead of marking them seen", async () => {
+    const { token, user } = await signup("a@x.io");
+    const items = Array.from({ length: MAX_NEW_PER_REFRESH + 5 }, (_, i) => ({
+      guid: `g${i}`,
+      link: `https://f.example/${i}`,
+      title: `T${i}`,
+    }));
+    feeds.set("https://f.example/rss", rss(items));
+    expect((await call("POST", "/api/feeds", { token, body: { url: "https://f.example/rss" } })).status).toBe(
+      201,
+    );
+    const repo = new Repo(deps.db);
+    expect(await refreshUserFeeds(repo, deps, user.id)).toBe(MAX_NEW_PER_REFRESH);
+    expect(await refreshUserFeeds(repo, deps, user.id)).toBe(5);
+    expect(await refreshUserFeeds(repo, deps, user.id)).toBe(0);
+  });
+
+  it("caps feeds per user", async () => {
+    const { token, user } = await signup("a@x.io");
+    const repo = new Repo(deps.db);
+    for (let i = 0; i < MAX_FEEDS_PER_USER; i++) repo.addFeed(user.id, `https://f.example/${i}`, `F${i}`);
+    feeds.set("https://f.example/new", rss([]));
+    const r = await call("POST", "/api/feeds", { token, body: { url: "https://f.example/new" } });
+    expect(r.status).toBe(400);
+    expect(r.json.error).toMatch(/limit/);
   });
 });
 
@@ -470,7 +553,7 @@ Bad,file:///tmp/private,invalid,,unread
     let peak = 0;
     let done = 0;
     for (let i = 0; i < 10; i++)
-      q.push(async () => {
+      q.push("u", `j${i}`, async () => {
         active++;
         peak = Math.max(peak, active);
         await new Promise((r) => setTimeout(r, 2));
@@ -481,6 +564,90 @@ Bad,file:///tmp/private,invalid,,unread
     await q.drain();
     expect(done).toBe(10);
     expect(peak).toBe(3);
+  });
+
+  it("TaskQueue is round-robin across users and dedupes ids", async () => {
+    const q = new TaskQueue(1);
+    const order: string[] = [];
+    const job = (tag: string) => async () => {
+      order.push(tag);
+    };
+    for (let i = 0; i < 4; i++) q.push("heavy", `h${i}`, job(`h${i}`));
+    q.push("light", "l0", job("l0"));
+    q.push("light", "l1", job("l1"));
+    expect(q.push("light", "l1", job("dup"))).toBe(false);
+    expect(q.sizeFor("heavy")).toBe(4);
+    await q.drain();
+    // h0 starts immediately; afterwards users alternate instead of light waiting behind all of heavy.
+    expect(order).toEqual(["h0", "h1", "l0", "h2", "l1", "h3"]);
+    expect(q.size).toBe(0);
+  });
+
+  it("rejects uploads with too many items and admission beyond the per-user backlog", async () => {
+    const { token, user } = await signup("a@x.io");
+    const rows = (n: number, prefix: string) =>
+      "title,url,time_added,tags,status\n" +
+      Array.from({ length: n }, (_, i) => `t,https://example.com/${prefix}${i},1704067200,,unread`).join(
+        "\n",
+      );
+    const big = await call("POST", "/api/import?format=pocket", { token, raw: rows(5001, "x") });
+    expect(big.status).toBe(400);
+    expect(big.json.error).toMatch(/too many items/);
+
+    // Simulate a large existing backlog of pending captures.
+    const repo = new Repo(deps.db);
+    deps.db.exec("BEGIN");
+    for (let i = 0; i < 4990; i++)
+      repo.saveArticle(user.id, null, { url: `https://example.com/p${i}`, source: "import", pending: true });
+    deps.db.exec("COMMIT");
+    const over = await call("POST", "/api/import?format=pocket", { token, raw: rows(20, "y") });
+    expect(over.status).toBe(429);
+    const ok = await call("POST", "/api/import?format=pocket", { token, raw: rows(10, "z") });
+    expect(ok.status).toBe(200);
+    expect(ok.json.imported).toBe(10);
+  });
+
+  it("resumePending re-enqueues pending rows idempotently", async () => {
+    const { token, user } = await signup("a@x.io");
+    const repo = new Repo(deps.db);
+    repo.saveArticle(user.id, null, { url: "https://example.com/left", source: "import", pending: true });
+    // A fresh app over the same DB (as after a restart).
+    const app2 = createApp(deps);
+    expect(app2.resumePending()).toBe(1);
+    expect(app2.resumePending()).toBe(0); // already queued
+    await app2.drain();
+    const items = (await call("GET", "/api/articles", { token })).json.items;
+    expect(items[0].captureStatus).toBe("ok");
+    expect(app2.resumePending()).toBe(0);
+  });
+
+  it("zip bomb and oversized zips are refused with 413; non-omnivore zips with 400", async () => {
+    const { token } = await signup("a@x.io");
+    const bomb = zipSync(
+      { "metadata_0.json": new Uint8Array(MAX_UNZIPPED + 1024 * 1024).fill(32) },
+      { level: 9 },
+    );
+    expect(bomb.length).toBeLessThan(200_000);
+    const r = await call("POST", "/api/import?format=auto", { token, raw: bomb as Uint8Array<ArrayBuffer> });
+    expect(r.status).toBe(413);
+
+    const many: Record<string, Uint8Array> = {};
+    for (let i = 0; i < 1001; i++) many[`f${i}.txt`] = strToU8("x");
+    const r2 = await call("POST", "/api/import", { token, raw: zipSync(many) as Uint8Array<ArrayBuffer> });
+    expect(r2.status).toBe(413);
+
+    const csvZip = zipSync({ "part_000000.csv": strToU8("title,url\nA,https://example.com/a") });
+    expect(
+      (await call("POST", "/api/import", { token, raw: csvZip as Uint8Array<ArrayBuffer> })).status,
+    ).toBe(400);
+    expect(
+      (
+        await call("POST", "/api/import", {
+          token,
+          raw: strToU8("PK\x03\x04garbage") as Uint8Array<ArrayBuffer>,
+        })
+      ).status,
+    ).toBe(400);
   });
 });
 
@@ -546,6 +713,31 @@ describe("export + kindle", () => {
     expect(mailer.sent[0].attachments?.[0].contentType).toBe("application/epub+zip");
     expect(mailer.sent[0].attachments?.[0].filename).toMatch(/\.epub$/);
   });
+
+  it("kindle: CRLF in title never reaches the subject; send failure is 502", async () => {
+    make({ smtpUrl: "smtp://fake.invalid:25" });
+    const s = await signup("k@x.io");
+    const a = await call("POST", "/api/articles", {
+      token: s.token,
+      body: { url: "https://a.example/crlf" },
+    });
+    await call("PATCH", "/api/me", { token: s.token, body: { kindleEmail: "me@kindle.com" } });
+    deps.db
+      .prepare("UPDATE articles SET title = ? WHERE id = ?")
+      .run("Hello\r\nBcc: victim@x.io\nX", a.json.id);
+    expect((await call("POST", `/api/articles/${a.json.id}/kindle`, { token: s.token })).status).toBe(202);
+    expect(mailer.sent[0].subject).not.toMatch(/[\r\n]/);
+    expect(mailer.sent[0].subject).toBe("Hello Bcc: victim@x.io X");
+    expect(mailer.sent[0].from).toBe("later@localhost");
+
+    mailer.send = async () => {
+      throw new Error("SMTP 550 mailbox unavailable");
+    };
+    const r = await call("POST", `/api/articles/${a.json.id}/kindle`, { token: s.token });
+    expect(r.status).toBe(502);
+    expect(r.json.error).not.toMatch(/550/); // no SMTP internals leaked
+    expect((await call("POST", "/api/articles/missing/kindle", { token: s.token })).status).toBe(404);
+  });
 });
 
 describe("ai", () => {
@@ -600,6 +792,30 @@ describe("obsidian sync", () => {
     expect(one.json.cursor > cursor).toBe(true);
 
     expect((await call("GET", "/api/obsidian/sync?since=garbage", { token })).status).toBe(400);
+  });
+
+  it("pages by (updatedAt, id) without skipping ties at the same millisecond", async () => {
+    const { token } = await signup("a@x.io");
+    for (let i = 0; i < 5; i++)
+      await call("POST", "/api/articles", { token, body: { url: `https://a.example/t${i}` } });
+    deps.db.exec("UPDATE articles SET updated_at = '2026-01-01T00:00:00.000Z'");
+    const seen: string[] = [];
+    let since: string | null = null;
+    for (let guard = 0; guard < 10; guard++) {
+      const q: string = since ? `&since=${encodeURIComponent(since)}` : "";
+      const r = await call("GET", `/api/obsidian/sync?limit=2${q}`, { token });
+      expect(r.status).toBe(200);
+      for (const a of r.json.articles) seen.push(a.path);
+      since = r.json.cursor;
+      if (!r.json.nextCursor) break;
+      expect(r.json.nextCursor).toBe(r.json.cursor);
+    }
+    expect(seen).toHaveLength(5);
+    expect(new Set(seen).size).toBe(5);
+    // Plain ISO since is strictly-after, so the tied rows are excluded.
+    const iso = await call("GET", `/api/obsidian/sync?since=2026-01-01T00:00:00.000Z`, { token });
+    expect(iso.json.articles).toHaveLength(0);
+    expect((await call("GET", "/api/obsidian/sync?limit=0", { token })).status).toBe(400);
   });
 });
 
