@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Later options</title>
+  </head>
+  <body>
+    <h1>Later options</h1>
+    <form id="settings">
+      <p>
+        <label
+          >Server URL <input id="server" type="url" required placeholder="http://localhost:4800"
+        /></label>
+      </p>
+      <p>
+        <label>API token <input id="token" type="password" required autocomplete="off" /></label>
+      </p>
+      <button type="submit">Save settings and grant server access</button>
+    </form>
+    <p id="status" role="status"></p>
+    <script src="options.js" type="module"></script>
+  </body>
+</html>

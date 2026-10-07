@@ -1,0 +1,5 @@
+[
+  {"id":"one","slug":"space","title":"Space","url":"https://example.com/omnivore","description":"A story","author":"A. Writer","labels":[{"name":"science","color":"blue"},"space"],"state":"SUCCEEDED","savedAt":"2024-01-01T01:00:00+01:00","highlights":[{"quote":"First thought","annotation":"My note"},{"quote":"Second thought"}]},
+  {"id":"two","slug":"old","title":"Old story","url":"https://example.com/archived","labels":[],"state":"ARCHIVED","savedAt":"2024-01-02T00:00:00Z"},
+  {"id":"three","url":"mailto:someone@example.com","labels":[],"savedAt":"bad"}
+]

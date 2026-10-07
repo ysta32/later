@@ -1,0 +1,6 @@
+URL,Title,Selection,Folder,Timestamp
+https://example.com/instapaper,"A ""quoted"" title","A selected passage
+with a second line",Research,1704067200
+https://example.com/archived,Old story,,Archive,1704153600
+https://example.com/favorite,Favorite,,Starred,invalid
+,No URL,,Research,1704067200

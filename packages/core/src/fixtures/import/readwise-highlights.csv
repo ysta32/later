@@ -1,0 +1,4 @@
+Highlight,Book Title,Book Author,Amazon Book ID,Note,Color,Tags,Location Type,Location,Highlighted at,Document tags,URL
+First thought,Essay,A. Writer,,My note,yellow,idea,web,1,2024-01-01T00:00:00Z,"[""science""]",https://example.com/essay
+Second thought,Essay,A. Writer,,,yellow,idea,web,2,2024-01-02T00:00:00Z,space,https://example.com/essay
+Book passage,Book,A. Writer,123,,yellow,,page,42,2024-01-01,,

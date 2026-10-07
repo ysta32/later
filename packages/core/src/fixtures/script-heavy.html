@@ -1,0 +1,32 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Script Heavy</title>
+    <meta name="description" content="A page that is mostly scripts with a tiny bit of text." />
+    <style>
+      body {
+        color: red;
+      }
+    </style>
+    <script>
+      var tracking = "evil";
+      document.write("<p>injected</p>");
+    </script>
+  </head>
+  <body onload="steal()">
+    <script>
+      for (var i = 0; i < 10; i++) {
+        console.log("tracker " + i);
+      }
+    </script>
+    <main>
+      <p onclick="alert(1)">Short visible text here.</p>
+      <iframe src="https://ads.example/frame"></iframe>
+      <iframe src="https://www.youtube.com/embed/abc123"></iframe>
+    </main>
+    <script type="module">
+      import "/app.js";
+    </script>
+  </body>
+</html>

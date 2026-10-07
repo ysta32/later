@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://later-app.vercel.app/sitemap.xml

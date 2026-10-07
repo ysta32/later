@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Later: open-source read-it-later app that never fails to save</title>
+<meta name="description" content="Later is an open-source, free-to-start read-it-later app with reliable capture, a beautiful reader, highlights, Send to Kindle, and one-command self-hosting.">
+<link rel="canonical" href="https://later-app.vercel.app/">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<meta name="theme-color" content="#4f46e5">
+<meta property="og:type" content="website">
+<meta property="og:title" content="Later: open-source read-it-later app that never fails to save">
+<meta property="og:description" content="Later is an open-source, free-to-start read-it-later app with reliable capture, a beautiful reader, highlights, Send to Kindle, and one-command self-hosting.">
+<meta property="og:url" content="https://later-app.vercel.app/">
+<meta property="og:image" content="https://later-app.vercel.app/og.svg">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="stylesheet" href="/styles.css">
+<script>try{var t=localStorage.getItem('theme');if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<script type="application/ld+json">{"@context":"https://schema.org","@type":"SoftwareApplication","name":"Later","applicationCategory":"ProductivityApplication","operatingSystem":"Web, Docker","description":"Open-source, free-to-start read-it-later app.","url":"https://later-app.vercel.app/","codeRepository":"https://github.com/ysta32/later","offers":{"@type":"Offer","price":"0","priceCurrency":"USD"}}</script>
+</head>
+<body>
+<header class="nav"><div class="wrap nav-in"><a class="brand" href="/"><svg width="22" height="22" viewBox="0 0 32 32" aria-hidden="true"><use href="/favicon.svg#i"/></svg>Later</a><nav><a href="/#features">Features</a><a href="/self-hosted-read-it-later/">Self-host</a><a class="btn sm" href="https://github.com/ysta32/later">GitHub</a></nav></div></header>
+<main>
+<section class="hero"><div class="wrap">
+<p class="eyebrow">Open source &middot; Free to start &middot; Self-host today</p>
+<h1>Save it for <span class="grad">later</span>. Actually read it later.</h1>
+<p class="lead">Later is an open-source read-it-later app built around capture that never fails and a reader that is a pleasure to use. Pocket and Omnivore are gone; your reading list does not have to be.</p>
+<div class="cta"><a class="btn" href="https://github.com/ysta32/later">Get Later on GitHub</a><a class="btn ghost" href="#selfhost">Self-host in one command</a></div>
+<p class="note">Hosted version coming soon. Self-hosting works today.</p>
+</div></section>
+<section class="wrap" id="why"><h2>Why now</h2>
+<div class="grid">
+<div class="card"><h3>Pocket shut down</h3><p>Pocket closed in July 2025. <a href="/pocket-alternative/">Move your saves to Later.</a></p></div>
+<div class="card"><h3>Omnivore shut down</h3><p>Omnivore closed in November 2024. <a href="/omnivore-alternative/">Import your export.</a></p></div>
+<div class="card"><h3>Instapaper is in maintenance mode</h3><p>And Send to Kindle is behind a paywall. <a href="/instapaper-alternative/">See the difference.</a></p></div>
+<div class="card"><h3>Readwise Reader has no free tier</h3><p>Users also report failed captures on news sites. <a href="/readwise-reader-alternative/">Compare.</a></p></div>
+</div></section>
+<section class="wrap" id="features"><h2>Everything you need to save and read</h2>
+<div class="grid"><div class="card"><h3>Capture that never fails</h3><p>Server-side extraction, plus a browser extension that captures the rendered page from your own logged-in session, so paywalled and JavaScript-heavy pages still save.</p></div><div class="card"><h3>Save from anywhere</h3><p>Share sheet and PWA, email-in, RSS and newsletters, and a bookmarklet.</p></div><div class="card"><h3>A reader you will want to use</h3><p>Clean typography, light and dark themes, highlights and notes, tags, and full-text search.</p></div><div class="card"><h3>Offline PWA</h3><p>Install it on your phone or desktop and read your saved articles without a connection.</p></div><div class="card"><h3>Free Send to Kindle and EPUB</h3><p>Send articles to your Kindle or export them as EPUB. No paid tier required.</p></div><div class="card"><h3>Text-to-speech</h3><p>Listen to articles instead of reading them.</p></div><div class="card"><h3>Optional AI, never required</h3><p>Summaries and ask-your-library powered by Claude when you add a key. Without one, everything else works the same.</p></div><div class="card"><h3>Import and export</h3><p>Bring your library from Pocket, Omnivore, Instapaper, Readwise, or browser bookmarks. Export to Markdown or JSON, with Obsidian sync.</p></div><div class="card"><h3>Self-host in one command</h3><p>One Docker container and one volume. Your data stays yours.</p></div></div></section>
+<section class="wrap" id="selfhost"><h2>Self-host in one command</h2>
+<p>Run Later on your own machine or server. Your library lives in a single Docker volume.</p>
+<pre><code>docker run -p 4800:4800 -v later-data:/data ghcr.io/ysta32/later</code></pre>
+<p>Then open <code>http://localhost:4800</code>. <a href="/self-hosted-read-it-later/">Read the self-hosting guide.</a></p></section>
+<section class="wrap"><div class="band"><h2>Open source, so it can not be shut down on you</h2><p>The code is public and your data is exportable to Markdown and JSON at any time.</p><a class="btn" href="https://github.com/ysta32/later">Star Later on GitHub</a></div></section>
+</main>
+<footer class="foot"><div class="wrap"><div class="cols"><div><strong>Later</strong><p>Open-source read-it-later. Free to start. Self-host today; hosted version coming soon.</p></div><div><strong>Alternatives</strong><a href="/pocket-alternative/">Pocket alternative</a><a href="/omnivore-alternative/">Omnivore alternative</a><a href="/instapaper-alternative/">Instapaper alternative</a><a href="/readwise-reader-alternative/">Readwise Reader alternative</a><a href="/self-hosted-read-it-later/">Self-hosted read-it-later</a></div><div><strong>Project</strong><a href="https://github.com/ysta32/later">Source on GitHub</a><a href="https://github.com/ysta32/later/issues">Report an issue</a></div></div></div></footer></body></html>

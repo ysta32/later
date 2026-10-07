@@ -1,0 +1,9 @@
+{
+  "name": "@later/extension",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "zip": "zip -r later-extension.zip manifest.json src -x '*.test.ts' '*.d.ts'"
+  }
+}

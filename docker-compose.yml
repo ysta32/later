@@ -1,0 +1,18 @@
+services:
+  later:
+    build: .
+    image: ghcr.io/ysta32/later:latest
+    restart: unless-stopped
+    ports:
+      - "4800:4800"
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      PORT: "4800"
+      LATER_DATA_DIR: /data
+    volumes:
+      - later-data:/data
+
+volumes:
+  later-data:
