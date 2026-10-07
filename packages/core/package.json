@@ -1,1 +1,19 @@
-{"name":"@later/core","version":"0.1.0","type":"module","exports":{".":"./src/index.ts","./*":"./src/*.ts"},"dependencies":{"@anthropic-ai/sdk":"^0.132.0","@mozilla/readability":"^0.6.0","fast-xml-parser":"^5.11.2","fflate":"^0.8.3","linkedom":"^0.18.13","papaparse":"^5.7.0","sanitize-html":"^2.18.0","turndown":"^7.2.4"}}
+{
+  "name": "@later/core",
+  "version": "0.1.0",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./*": "./src/*.ts"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.132.0",
+    "@mozilla/readability": "^0.6.0",
+    "fast-xml-parser": "^5.11.2",
+    "fflate": "^0.8.3",
+    "linkedom": "^0.18.13",
+    "papaparse": "^5.7.0",
+    "sanitize-html": "^2.18.0",
+    "turndown": "^7.2.4"
+  }
+}

@@ -4,7 +4,7 @@ import { lookup as dnsLookup } from "node:dns/promises";
 import { isIP, type LookupFunction } from "node:net";
 import http from "node:http";
 import https from "node:https";
-import { Readable } from "node:stream";
+import { pipeline, Readable } from "node:stream";
 import zlib from "node:zlib";
 import type { Extracted } from "./types.ts";
 import { countWords, htmlToText, sanitizeHtml } from "./sanitize.ts";
@@ -29,6 +29,8 @@ export interface FetchExtractOptions {
   lookup?: LookupFn;
   /** Skip the private-address check (self-hosters; server sets it from LATER_ALLOW_PRIVATE_FETCH=1). */
   allowPrivate?: boolean;
+  /** Max (decompressed) response body size in bytes; default 15 MB. */
+  maxBytes?: number;
 }
 
 /** Text shorter than this is considered a failed/insufficient extraction. */
@@ -612,9 +614,15 @@ export function pinnedRequest(
   }
   return new Promise<Response>((resolve, reject) => {
     const req = mod.request(options, (res) => {
+      // Tear down the whole chain (decoder, response, socket); used for every discarded/failed body.
+      const destroyAll = (decoder?: Readable): void => {
+        decoder?.destroy();
+        res.destroy();
+        req.destroy();
+      };
       const status = res.statusCode ?? 0;
       if (status < 200 || status > 599) {
-        res.destroy();
+        destroyAll();
         reject(new Error(`Unexpected HTTP status ${status}`));
         return;
       }
@@ -625,32 +633,71 @@ export function pinnedRequest(
       }
       const nullBody = status === 204 || status === 205 || status === 304 || (status >= 300 && status < 400);
       if (nullBody) {
-        res.resume();
+        // Never drain: a redirect with an endless body would keep the socket alive after we return.
+        destroyAll();
         resolve(new Response(null, { status, headers }));
         return;
       }
       const enc = (headers.get("content-encoding") ?? "").trim().toLowerCase();
-      let body: Readable = res;
+      let decoder: Readable | undefined;
       if (enc && enc !== "identity") {
-        const decoder =
+        decoder =
           enc === "gzip" || enc === "x-gzip"
             ? zlib.createGunzip()
             : enc === "deflate"
               ? zlib.createInflate()
               : enc === "br"
                 ? zlib.createBrotliDecompress()
-                : null;
+                : undefined;
         if (!decoder) {
-          res.destroy();
+          destroyAll();
           reject(new Error(`Unsupported content-encoding "${enc}"`));
           return;
         }
-        res.on("error", (e) => decoder.destroy(e));
-        body = res.pipe(decoder);
         headers.delete("content-encoding");
         headers.delete("content-length");
+        // pipeline destroys both sides when either errors; also drop the socket.
+        pipeline(res, decoder as zlib.Gunzip, (err) => {
+          if (err) req.destroy();
+        });
       }
-      resolve(new Response(Readable.toWeb(body) as unknown as BodyInit, { status, headers }));
+      const source: Readable = decoder ?? res;
+      let done = false;
+      const body = new ReadableStream<Uint8Array>(
+        {
+          start(ctrl) {
+            source.on("data", (chunk: Buffer) => {
+              if (done) return;
+              ctrl.enqueue(new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength));
+              if ((ctrl.desiredSize ?? 0) <= 0) source.pause();
+            });
+            source.on("end", () => {
+              if (done) return;
+              done = true;
+              ctrl.close();
+            });
+            const fail = (err: unknown): void => {
+              if (done) return;
+              done = true;
+              ctrl.error(err instanceof Error ? err : new Error("Response body aborted"));
+              destroyAll(decoder);
+            };
+            source.on("error", fail);
+            source.on("close", () => fail(new Error("Response body closed prematurely")));
+            res.on("error", fail);
+            res.on("aborted", () => fail(new Error("Response aborted")));
+          },
+          pull() {
+            source.resume();
+          },
+          cancel() {
+            done = true;
+            destroyAll(decoder);
+          },
+        },
+        { highWaterMark: 4 },
+      );
+      resolve(new Response(body, { status, headers }));
     });
     req.on("error", reject);
     req.end();
@@ -672,11 +719,49 @@ type Transport = (
 
 interface FetchCtx {
   transport: Transport;
+  maxBytes: number;
   timeoutMs: number;
   policy: UrlPolicyOptions;
 }
 
 const MAX_REDIRECTS = 5;
+const DEFAULT_MAX_BYTES = 15 * 1024 * 1024;
+
+/** Read a body incrementally, aborting as soon as it exceeds maxBytes (decompression-bomb safe). */
+async function readCapped(res: Response, maxBytes: number, url: string): Promise<Uint8Array> {
+  const tooLarge = (): ExtractError =>
+    new ExtractError("http", `Response too large (over ${maxBytes} bytes) at ${url}`, { status: res.status });
+  const declared = Number(res.headers.get("content-length"));
+  if (Number.isFinite(declared) && declared > maxBytes) {
+    await cancelBody(res);
+    throw tooLarge();
+  }
+  if (!res.body) return new Uint8Array(0);
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > maxBytes) {
+      try {
+        await reader.cancel();
+      } catch {
+        // Cancellation is best-effort; we are already failing this response.
+      }
+      throw tooLarge();
+    }
+    chunks.push(value);
+  }
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const c of chunks) {
+    out.set(c, off);
+    off += c.byteLength;
+  }
+  return out;
+}
 
 class RetryableError extends Error {
   inner: ExtractError;
@@ -770,8 +855,9 @@ async function fetchOnce(startUrl: string, ua: string, ctx: FetchCtx): Promise<F
     }
     let bytes: Uint8Array;
     try {
-      bytes = new Uint8Array(await res.arrayBuffer());
+      bytes = await readCapped(res, ctx.maxBytes, url);
     } catch (err) {
+      if (err instanceof ExtractError) throw err;
       if (controller.signal.aborted) throw timedOut(err);
       throw new RetryableError(new ExtractError("fetch", `Error reading body of ${url}`, { cause: err }));
     }
@@ -815,6 +901,7 @@ export async function fetchAndExtract(url: string, opts: FetchExtractOptions = {
       ? (u, init) => injected(u, { redirect: "manual", signal: init.signal, headers: init.headers })
       : pinnedRequest,
     timeoutMs: opts.timeoutMs ?? 15000,
+    maxBytes: opts.maxBytes ?? DEFAULT_MAX_BYTES,
     policy: { lookup: opts.lookup, allowPrivate: opts.allowPrivate ?? false },
   };
   // Only cheap synchronous checks here; DNS validation happens inside the timed fetch.

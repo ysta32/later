@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { createServer, type IncomingHttpHeaders, type Server } from "node:http";
-import { gzipSync } from "node:zlib";
+import { createGzip, gzipSync } from "node:zlib";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   assertPublicUrl,
@@ -363,6 +363,23 @@ describe("fix round regressions", () => {
     expect(f.calls.length).toBe(0);
   });
 
+  it("size cap applies to injected fetch bodies and declared content-length", async () => {
+    const big = "<html><body><p>" + "z".repeat(5000) + "</p></body></html>";
+    const f = fakeFetch({
+      "https://big.example/": () => html(big),
+      "https://big.example/declared": () => html("<p>x</p>", { "content-length": "999999999" }),
+    });
+    expect(
+      await codeOf(
+        fetchAndExtract("https://big.example/", { fetch: f, lookup: publicLookup, maxBytes: 1000 }),
+      ),
+    ).toBe("http");
+    expect(
+      await codeOf(fetchAndExtract("https://big.example/declared", { fetch: f, lookup: publicLookup })),
+    ).toBe("http");
+    expect(f.calls.length).toBe(2);
+  });
+
   it("empty main page still falls back to AMP", async () => {
     const shell = `<html><head><title>T</title><link rel="amphtml" href="/a.amp"></head><body><div id="app"></div><script>x()</script></body></html>`;
     const f = fakeFetch({
@@ -381,10 +398,47 @@ describe("fix round regressions", () => {
     let server: Server;
     let port = 0;
     const seen: IncomingHttpHeaders[] = [];
+    const closes: string[] = [];
+    const bomb = gzipSync(Buffer.alloc(20 * 1024 * 1024, 0x20));
+    const waitClosed = async (path: string): Promise<void> => {
+      const t0 = Date.now();
+      while (!closes.includes(path)) {
+        if (Date.now() - t0 > 2000) throw new Error(`server connection for ${path} never closed`);
+        await new Promise((r) => setTimeout(r, 10));
+      }
+    };
+    const sig = (): AbortSignal => new AbortController().signal;
     beforeAll(async () => {
       server = createServer((req, res) => {
         seen.push(req.headers);
-        if (req.url === "/redir") {
+        const closed = (): void => {
+          closes.push(req.url ?? "");
+        };
+        res.on("close", closed);
+        if (req.url === "/endless-redirect") {
+          res.writeHead(302, { location: "/plain" });
+          const t = setInterval(() => res.write("x".repeat(1024)), 5);
+          res.on("close", () => clearInterval(t));
+        } else if (req.url === "/endless-gzip") {
+          res.writeHead(200, { "content-type": "text/html", "content-encoding": "gzip" });
+          const gz = createGzip();
+          gz.pipe(res);
+          const t = setInterval(() => {
+            gz.write("<p>" + "y".repeat(1024) + "</p>");
+            gz.flush(); // emit compressed bytes now so the client sees a live stream
+          }, 5);
+          res.on("close", () => {
+            clearInterval(t);
+            gz.destroy();
+          });
+        } else if (req.url === "/bad-gzip") {
+          res.writeHead(200, { "content-type": "text/html", "content-encoding": "gzip" });
+          res.write(Buffer.from("this is definitely not gzip data"));
+          // never end: only the client tearing down the socket closes it
+        } else if (req.url === "/bomb") {
+          res.writeHead(200, { "content-type": "text/html", "content-encoding": "gzip" });
+          res.end(bomb);
+        } else if (req.url === "/redir") {
           res.writeHead(302, { location: "/gz" });
           res.end();
         } else if (req.url === "/gz") {
@@ -411,7 +465,13 @@ describe("fix round regressions", () => {
       }
       if (!port) throw new Error("no free port in 4870-4899");
     });
-    afterAll(() => new Promise<void>((r) => server.close(() => r())));
+    afterAll(
+      () =>
+        new Promise<void>((r) => {
+          server.close(() => r());
+          server.closeAllConnections();
+        }),
+    );
 
     it("connects to the pinned address without re-resolving, keeping the Host header", async () => {
       // ".invalid" never resolves in DNS: success proves the connection used the pinned address.
@@ -429,6 +489,54 @@ describe("fix round regressions", () => {
       const r = await fetchAndExtract(`http://127.0.0.1:${port}/redir`, { allowPrivate: true });
       expect(r.title).toBe("Why Plain Text Wins");
       expect(seen.at(-1)?.["accept-encoding"]).toContain("gzip");
+    });
+
+    it("discarded redirect bodies are destroyed, not drained", async () => {
+      const res = await pinnedRequest(
+        `http://127.0.0.1:${port}/endless-redirect`,
+        { headers: {}, signal: sig() },
+        null,
+      );
+      expect(res.status).toBe(302);
+      expect(res.headers.get("location")).toBe("/plain");
+      await waitClosed("/endless-redirect");
+    });
+
+    it("cancelling a decompressed body closes the upstream connection", async () => {
+      const res = await pinnedRequest(
+        `http://127.0.0.1:${port}/endless-gzip`,
+        { headers: {}, signal: sig() },
+        null,
+      );
+      const reader = res.body!.getReader();
+      expect((await reader.read()).done).toBe(false);
+      await reader.cancel();
+      await waitClosed("/endless-gzip");
+    });
+
+    it("decoder errors propagate to the response and close the socket", async () => {
+      const res = await pinnedRequest(
+        `http://127.0.0.1:${port}/bad-gzip`,
+        { headers: {}, signal: sig() },
+        null,
+      );
+      await expect(res.arrayBuffer()).rejects.toThrow();
+      await waitClosed("/bad-gzip");
+    });
+
+    it("caps decompressed size (gzip bomb) and closes the connection", async () => {
+      const e = await fetchAndExtract(`http://127.0.0.1:${port}/bomb`, { allowPrivate: true }).catch(
+        (x: unknown) => x,
+      );
+      expect(e).toBeInstanceOf(ExtractError);
+      expect((e as ExtractError).code).toBe("http");
+      expect((e as ExtractError).message).toMatch(/too large/);
+      await waitClosed("/bomb");
+      const small = await fetchAndExtract(`http://127.0.0.1:${port}/endless-gzip`, {
+        allowPrivate: true,
+        maxBytes: 64 * 1024,
+      }).catch((x: unknown) => x);
+      expect((small as ExtractError).code).toBe("http");
     });
 
     it("default transport still blocks private targets without allowPrivate", async () => {
