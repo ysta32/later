@@ -100,6 +100,16 @@ describe("parseFeed", () => {
     expect(result.items[0].contentHtml).toContain("<p>Hello</p>");
   });
 
+  it.each(["content", "summary"])("preserves mixed-content order in Atom XHTML %s", (element) => {
+    const result = parseFeed(
+      `<atom:feed xmlns:atom="http://www.w3.org/2005/Atom"><atom:entry><atom:title>First</atom:title></atom:entry><atom:entry><atom:${element} type="xhtml"><div xmlns="http://www.w3.org/1999/xhtml"><p>Before <strong>bold</strong> after <em>one</em> between <em>two &amp; three</em> end.</p></div></atom:${element}></atom:entry></atom:feed>`,
+      feedUrl,
+    );
+    expect(result.items[1].contentHtml).toContain(
+      "<p>Before <strong>bold</strong> after <em>one</em> between <em>two &amp; three</em> end.</p>",
+    );
+  });
+
   it("parses JSON Feed HTML and text content with relative URLs", () => {
     const result = parseFeed(
       `  ${JSON.stringify({

@@ -50,12 +50,13 @@ function escapeHtml(value: string): string {
   return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
-function atomContent(value: unknown): string | null {
+function atomContent(value: unknown, orderedBody: unknown): string | null {
   if (value === undefined || value === null) return null;
   const content = node(value);
   if (content["@_type"] === "xhtml") {
-    const { "@_type": _type, ...body } = content;
-    return new XMLBuilder({ ignoreAttributes: false }).build(body) as string;
+    return new XMLBuilder({ ignoreAttributes: false, preserveOrder: true }).build(
+      list(orderedBody),
+    ) as string;
   }
   const body = text(value);
   return content["@_type"] === "html" ? body : escapeHtml(body);
@@ -87,15 +88,14 @@ export function parseFeed(xml: string, feedUrl: string): Feed {
   }
 
   if (XMLValidator.validate(source) !== true) throw new Error("Invalid feed XML");
-  const parsed = node(
-    new XMLParser({
-      ignoreAttributes: false,
-      removeNSPrefix: true,
-      parseTagValue: false,
-      parseAttributeValue: false,
-      trimValues: false,
-    }).parse(source),
-  );
+  const parserOptions = {
+    ignoreAttributes: false,
+    removeNSPrefix: true,
+    parseTagValue: false,
+    parseAttributeValue: false,
+    trimValues: false,
+  };
+  const parsed = node(new XMLParser(parserOptions).parse(source));
   if (parsed.rss !== undefined) {
     const channel = node(node(parsed.rss).channel);
     return {
@@ -120,10 +120,20 @@ export function parseFeed(xml: string, feedUrl: string): Feed {
   }
   if (parsed.feed !== undefined) {
     const feed = node(parsed.feed);
+    const orderedFeed = list(new XMLParser({ ...parserOptions, preserveOrder: true }).parse(source))
+      .map(node)
+      .find((element) => element.feed !== undefined);
+    const orderedEntries = list(orderedFeed?.feed)
+      .map(node)
+      .filter((element) => element.entry !== undefined);
     return {
       title: text(feed.title),
-      items: list(feed.entry).map((value): FeedItem => {
+      items: list(feed.entry).map((value, index): FeedItem => {
         const item = node(value);
+        const contentTag = item.content != null ? "content" : "summary";
+        const orderedContent = list(orderedEntries[index]?.entry)
+          .map(node)
+          .find((element) => element[contentTag] !== undefined);
         const link = list(item.link)
           .map(node)
           .find((link) => link["@_rel"] === undefined || link["@_rel"] === "alternate");
@@ -132,7 +142,7 @@ export function parseFeed(xml: string, feedUrl: string): Feed {
           guid: text(item.id) || url,
           url,
           title: text(item.title),
-          contentHtml: atomContent(item.content ?? item.summary),
+          contentHtml: atomContent(item.content ?? item.summary, orderedContent?.[contentTag]),
           publishedAt: date(item.published ?? item.updated),
         };
       }),

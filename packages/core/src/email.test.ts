@@ -27,6 +27,39 @@ describe("parseInbound", () => {
     ).toEqual({ inboundToken: "abc123", url: "https://example.com/story?x=1&y=2", extracted: null });
   });
 
+  it.each([
+    [
+      "https://en.wikipedia.org/wiki/Example_(disambiguation)",
+      "https://en.wikipedia.org/wiki/Example_(disambiguation)",
+    ],
+    [
+      "(https://en.wikipedia.org/wiki/Example_(disambiguation)).",
+      "https://en.wikipedia.org/wiki/Example_(disambiguation)",
+    ],
+    ["https://example.com/a_(b_(c)).", "https://example.com/a_(b_(c))"],
+    ["(https://example.com/story).", "https://example.com/story"],
+    ["[https://example.com/story],", "https://example.com/story"],
+  ])("preserves URL parentheses while trimming prose punctuation: %s", (text, url) => {
+    expect(parseInbound({ ...envelope, text: `Read ${text}` })).toEqual({
+      inboundToken: "abc123",
+      url,
+      extracted: null,
+    });
+  });
+
+  it("preserves a substantial HTML newsletter with a short browser-link text alternative", () => {
+    const article = "This newsletter contains the complete story and useful details. ".repeat(10).trim();
+    const html = `<p>${article}</p><a href="https://example.com/newsletter">View in browser</a>`;
+    const result = parseInbound({
+      ...envelope,
+      text: "View in browser: https://example.com/newsletter",
+      html,
+    });
+    expect(result.url).toBeNull();
+    expect(result.extracted?.contentHtml).toContain(`<p>${article}</p>`);
+    expect(result.extracted?.textContent).toContain(article);
+  });
+
   it("recognizes an HTML link even if its label is not the URL", () => {
     expect(
       parseInbound({

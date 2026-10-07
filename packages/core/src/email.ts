@@ -61,19 +61,27 @@ export function parseInbound(input: InboundEmail): ParsedInbound {
   }
   const contentHtml = sanitizeHtml(document.body.innerHTML, "");
   const textContent = htmlToText(contentHtml);
-  const bodyText = input.text?.trim() || textContent;
   const urls = new Set<string>();
-  const otherText = bodyText.replace(/https?:\/\/[^\s<>"']+/gi, (match) => {
-    const candidate = match.replace(/[.,;!?)\]]+$/, "");
-    const url = httpUrl(candidate);
-    if (url) urls.add(url);
-    return url ? "" : match;
-  });
+  function withoutUrls(body: string): string {
+    return body.replace(/https?:\/\/[^\s<>"']+/gi, (match) => {
+      let candidate = match.replace(/[.,;!?\]]+$/, "");
+      let excessClosings = (candidate.match(/\)/g)?.length ?? 0) - (candidate.match(/\(/g)?.length ?? 0);
+      while (candidate.endsWith(")") && excessClosings > 0) {
+        candidate = candidate.slice(0, -1).replace(/[.,;!?\]]+$/, "");
+        excessClosings--;
+      }
+      const url = httpUrl(candidate);
+      if (url) urls.add(url);
+      return url ? "" : match;
+    });
+  }
+  const otherText = withoutUrls(input.text?.trim() || textContent);
+  const htmlText = input.html ? withoutUrls(textContent) : "";
   for (const anchor of document.querySelectorAll("a[href]")) {
     const url = httpUrl(anchor.getAttribute("href") ?? "");
     if (url) urls.add(url);
   }
-  if (urls.size === 1 && otherText.trim().length < 300) {
+  if (urls.size === 1 && otherText.trim().length < 300 && htmlText.trim().length < 300) {
     return { inboundToken, url: [...urls][0], extracted: null };
   }
   return {
