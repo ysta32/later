@@ -193,12 +193,10 @@ describe("extension background", () => {
 });
 
 function obsidian() {
-  const requestUrl = vi
-    .fn()
-    .mockResolvedValue({
-      status: 200,
-      json: { articles: [{ path: "2026/story.md", markdown: "# Story" }], cursor: "next" },
-    });
+  const requestUrl = vi.fn().mockResolvedValue({
+    status: 200,
+    json: { articles: [{ path: "2026/story.md", markdown: "# Story" }], cursor: "next" },
+  });
   const write = vi.fn().mockResolvedValue(undefined);
   const saveData = vi.fn().mockResolvedValue(undefined);
   class Plugin {
