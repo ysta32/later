@@ -48,6 +48,10 @@ const STOP = new Set(
   ),
 );
 
+function esc(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
 function terms(s: string): string[] {
   return (s.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? []).filter((w) => w.length > 1 && !STOP.has(w));
 }
@@ -150,7 +154,7 @@ export function createAi(opts: AiOptions = {}): Ai {
     async summarize(article) {
       const text = await call(
         SUMMARY_SYSTEM,
-        `<article title=${JSON.stringify(article.title)}>\n${article.textContent.slice(0, MAX_ARTICLE_CHARS)}\n</article>`,
+        `<article title="${esc(article.title)}">\n${esc(article.textContent.slice(0, MAX_ARTICLE_CHARS))}\n</article>`,
       );
       if (text) return { summary: text, method: "claude" };
       return { summary: extractiveSummary(article.textContent), method: "extractive" };
@@ -160,10 +164,10 @@ export function createAi(opts: AiOptions = {}): Ai {
       const body = used
         .map(
           (d, i) =>
-            `<article n="${i + 1}" title=${JSON.stringify(d.title)} url=${JSON.stringify(d.url)}>\n${d.text.slice(0, MAX_DOC_CHARS)}\n</article>`,
+            `<article n="${i + 1}" title="${esc(d.title)}" url="${esc(d.url)}">\n${esc(d.text.slice(0, MAX_DOC_CHARS))}\n</article>`,
         )
         .join("\n");
-      const text = used.length ? await call(ASK_SYSTEM, `${body}\n\nQuestion: ${question}`) : null;
+      const text = used.length ? await call(ASK_SYSTEM, `${body}\n\nQuestion: ${esc(question)}`) : null;
       if (text) return { answer: text, method: "claude", sources: used };
       return searchAnswer(question, docs);
     },
