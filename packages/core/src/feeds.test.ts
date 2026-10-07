@@ -4,6 +4,47 @@ import { parseFeed } from "./feeds.ts";
 const feedUrl = "https://example.com/news/feed.xml";
 
 describe("parseFeed", () => {
+  it.each(["content:encoded", "description", "content", "summary"])(
+    "trims pretty-printed XML metadata while preserving %s whitespace",
+    (contentTag) => {
+      const rss = contentTag === "content:encoded" || contentTag === "description";
+      const body = "\n  <p>Full story</p>  \n";
+      const itemTag = rss ? "item" : "entry";
+      const idTag = rss ? "guid" : "id";
+      const source = `
+        ${rss ? '<rss xmlns:content="http://purl.org/rss/1.0/modules/content/"><channel>' : '<feed xmlns="http://www.w3.org/2005/Atom">'}
+          <title>
+            News &amp; Notes
+          </title>
+          <${itemTag}>
+            <${idTag}>
+              g1
+            </${idTag}>
+            <title>
+              First story
+            </title>
+            ${rss ? "<link>\n  ../story \n</link>" : '<link href="  ../story  "/>'}
+            <${contentTag} type="html"><![CDATA[${body}]]></${contentTag}>
+          </${itemTag}>
+          <${itemTag}>
+            <${idTag}>   </${idTag}>
+            ${rss ? "<link> /fallback </link>" : '<link href=" /fallback "/>'}
+          </${itemTag}>
+        ${rss ? "</channel></rss>" : "</feed>"}`;
+
+      const result = parseFeed(source, feedUrl);
+      expect(result.title).toBe("News & Notes");
+      expect(result.items[0]).toEqual({
+        guid: "g1",
+        url: "https://example.com/story",
+        title: "First story",
+        contentHtml: body,
+        publishedAt: null,
+      });
+      expect(result.items[1].guid).toBe("https://example.com/fallback");
+    },
+  );
+
   it("parses RSS and prefers encoded content over the description", () => {
     const result = parseFeed(
       `<rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/">

@@ -99,14 +99,14 @@ export function parseFeed(xml: string, feedUrl: string): Feed {
   if (parsed.rss !== undefined) {
     const channel = node(node(parsed.rss).channel);
     return {
-      title: text(channel.title),
+      title: text(channel.title).trim(),
       items: list(channel.item).map((value): FeedItem => {
         const item = node(value);
         const url = resolve(item.link, feedUrl);
         return {
-          guid: text(item.guid) || url,
+          guid: text(item.guid).trim() || url,
           url,
-          title: text(item.title),
+          title: text(item.title).trim(),
           contentHtml:
             item.encoded !== undefined
               ? text(item.encoded)
@@ -127,7 +127,7 @@ export function parseFeed(xml: string, feedUrl: string): Feed {
       .map(node)
       .filter((element) => element.entry !== undefined);
     return {
-      title: text(feed.title),
+      title: text(feed.title).trim(),
       items: list(feed.entry).map((value, index): FeedItem => {
         const item = node(value);
         const contentTag = item.content != null ? "content" : "summary";
@@ -139,9 +139,9 @@ export function parseFeed(xml: string, feedUrl: string): Feed {
           .find((link) => link["@_rel"] === undefined || link["@_rel"] === "alternate");
         const url = resolve(link?.["@_href"], feedUrl);
         return {
-          guid: text(item.id) || url,
+          guid: text(item.id).trim() || url,
           url,
-          title: text(item.title),
+          title: text(item.title).trim(),
           contentHtml: atomContent(item.content ?? item.summary, orderedContent?.[contentTag]),
           publishedAt: date(item.published ?? item.updated),
         };
