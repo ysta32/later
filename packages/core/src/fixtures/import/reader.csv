@@ -1,0 +1,5 @@
+Title,URL,ID,Document tags,Saved date,Reading progress,Location,Seen
+Reader story,https://example.com/reader,one,"[""science"", ""space, time""]",2024-01-01T00:00:00Z,0,new,false
+Old story,https://example.com/archived,two,"['history', 'long reads, essays']",2024-01-02T00:00:00Z,100,archive,true
+Later story,https://example.com/later,three,[],bad,50,later,true
+Feed story,https://example.com/feed,four,,2024-01-01,0,feed,false

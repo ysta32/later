@@ -1,0 +1,5 @@
+title,url,time_added,tags,status
+"Space, time",https://example.com/pocket,1704067200,science|space,unread
+Old story,https://example.com/archived,1704153600,history,archive
+Duplicate,https://example.com/pocket,1704067200,science,unread
+Bad,file:///tmp/private,invalid,,unread
