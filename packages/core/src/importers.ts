@@ -73,10 +73,18 @@ function csv(data: string): Row[] {
         .trim()
         .toLowerCase(),
   });
-  if (result.errors.length) {
+  const invalidRows = new Set<number>();
+  for (const error of result.errors) {
+    if (error.row !== undefined) {
+      // Quote errors count the header; field mismatch errors count only data rows.
+      invalidRows.add(error.type === "Quotes" ? error.row - 1 : error.row);
+    }
+  }
+  const rows = result.data.filter((_, index) => !invalidRows.has(index));
+  if (!rows.length && result.errors.some((error) => error.code !== "UndetectableDelimiter")) {
     throw new Error(`Invalid import CSV: ${result.errors[0].message}`);
   }
-  return result.data;
+  return rows;
 }
 
 function parseCsv(format: ImportFormat, data: string): ImportItem[] {
@@ -92,7 +100,7 @@ function parseCsv(format: ImportFormat, data: string): ImportItem[] {
       const folder = text(row.folder);
       entry.state = folder?.toLowerCase() === "archive" ? "archived" : "inbox";
       entry.favorite = folder?.toLowerCase() === "starred";
-      entry.tags = folder && !["archive", "starred"].includes(folder.toLowerCase()) ? [folder] : [];
+      entry.tags = folder && !["archive", "starred", "unread"].includes(folder.toLowerCase()) ? [folder] : [];
       entry.savedAt = date(row.timestamp);
       const quote = text(row.selection);
       if (quote) entry.highlights.push({ quote, note: null, createdAt: null });
@@ -168,10 +176,24 @@ function parseBookmarks(data: string): ImportItem[] {
   const { document } = parseHTML(data);
   const items: ImportItem[] = [];
   let pendingFolder: string | null = null;
-  function visit(node: Element, folders: string[]): void {
+  const rootFolders = new Set([
+    "bookmarks bar",
+    "bookmarks toolbar",
+    "bookmarks menu",
+    "other bookmarks",
+    "mobile bookmarks",
+    "favorites",
+    "favorites bar",
+  ]);
+  function visit(node: Element, folders: string[], folderDepth: number): void {
     if (node.localName === "h3") pendingFolder = text(node.textContent);
     if (node.localName === "dl") {
-      folders = pendingFolder ? [...folders, pendingFolder] : folders;
+      if (pendingFolder) {
+        if (folderDepth > 0 || !rootFolders.has(pendingFolder.toLowerCase())) {
+          folders = [...folders, pendingFolder];
+        }
+        folderDepth++;
+      }
       pendingFolder = null;
     }
     if (node.localName === "a") {
@@ -185,9 +207,9 @@ function parseBookmarks(data: string): ImportItem[] {
         items.push(entry);
       }
     }
-    for (const child of node.children) visit(child, folders);
+    for (const child of node.children) visit(child, folders, folderDepth);
   }
-  for (const child of document.children) visit(child, []);
+  for (const child of document.children) visit(child, [], 0);
   return items;
 }
 

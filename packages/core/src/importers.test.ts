@@ -103,6 +103,35 @@ describe("import parsing", () => {
     expect(later).toMatchObject({ state: "inbox", savedAt: null, tags: [] });
     expect(feed.state).toBe("inbox");
   });
+  it.each(["Unread", " unread ", "UNREAD"])("treats Instapaper %s as the inbox", (folder) => {
+    expect(parseImport("instapaper", `URL,Title,Folder\nhttps://example.com,Story,${folder}`)).toMatchObject([
+      { url: "https://example.com", state: "inbox", favorite: false, tags: [] },
+    ]);
+  });
+  it.each(["pocket", "instapaper", "readwise"] as const)("skips malformed %s CSV rows", (format) => {
+    const result = parseImport(
+      format,
+      "url,title\nhttps://example.com/first,First\nhttps://example.com/few\nhttps://example.com/many,Many,Extra\nhttps://example.com/last,Last",
+    );
+    expect(result.map(({ url, title }) => ({ url, title }))).toEqual([
+      { url: "https://example.com/first", title: "First" },
+      { url: "https://example.com/last", title: "Last" },
+    ]);
+    expect(() => parseImport(format, "url,title\nhttps://example.com/few")).toThrow(/Invalid import CSV/);
+  });
+  it.each(["pocket", "instapaper", "readwise"] as const)("accepts one-column %s CSV", (format) => {
+    expect(
+      parseImport(format, "url\nhttps://example.com/one\nhttps://example.com/two").map(({ url }) => url),
+    ).toEqual(["https://example.com/one", "https://example.com/two"]);
+  });
+  it("preserves valid CSV rows before an unterminated quote", () => {
+    expect(
+      parseImport(
+        "pocket",
+        'url,title\nhttps://example.com/good,Good\nhttps://example.com/bad,"unterminated',
+      ),
+    ).toMatchObject([{ url: "https://example.com/good", title: "Good" }]);
+  });
   it("groups Readwise highlights by URL and retains notes, tags and dates", () => {
     const [entry] = parseImport("readwise", fixture("readwise-highlights.csv"));
     expect(entry).toMatchObject({ title: "Essay", tags: ["science", "idea", "space"], savedAt: null });
@@ -122,12 +151,38 @@ describe("import parsing", () => {
     expect(entry).toMatchObject({
       title: "Space & time",
       savedAt: "2024-01-01T00:00:00.000Z",
-      tags: ["Favorites", "science", "space", "Other", "extra"],
+      tags: ["science", "space", "Other", "extra"],
     });
-    expect(nested).toMatchObject({ tags: ["Favorites", "Nested"], savedAt: null });
-    expect(sibling.tags).toEqual(["Favorites"]);
+    expect(nested).toMatchObject({ tags: ["Nested"], savedAt: null });
+    expect(sibling.tags).toEqual([]);
     expect(other.tags).toEqual(["Other"]);
     expect(root.tags).toEqual([]);
+  });
+  it.each([
+    "Bookmarks bar",
+    "Bookmarks Bar",
+    "Bookmarks Toolbar",
+    "Bookmarks Menu",
+    "Other bookmarks",
+    "Other Bookmarks",
+    "Mobile bookmarks",
+    "Favorites",
+    "Favorites Bar",
+  ])("omits the %s root folder but preserves nested names and explicit tags", (folder) => {
+    const entries = parseImport(
+      "bookmarks",
+      `<DL>
+      <DT><H3>${folder}</H3><DL>
+        <DT><A HREF="https://example.com/direct">Direct</A></DT>
+        <DT><H3>${folder}</H3><DL>
+          <DT><A HREF="https://example.com/nested">Nested</A></DT>
+        </DL></DT>
+        <DT><A HREF="https://example.com/tagged" TAGS="${folder}">Tagged</A></DT>
+      </DL></DT>
+      <DT><H3>Research</H3><DL><DT><A HREF="https://example.com/research">Research</A></DT></DL></DT>
+    </DL>`,
+    );
+    expect(entries.map(({ tags }) => tags)).toEqual([[], [folder], [folder], ["Research"]]);
   });
   it("skips invalid URLs and malformed records, normalizes blank metadata", () => {
     const result = parseImport(
@@ -165,7 +220,7 @@ describe("import parsing", () => {
     const duplicate = data.split("\n")[1];
     expect(parseImport("readwise", `${data}${duplicate}\n`)[0].highlights).toHaveLength(2);
   });
-  it("rejects malformed exports rather than silently importing partial CSV", () => {
+  it("rejects malformed exports with no parseable records", () => {
     expect(() => parseImport("omnivore", "{")).toThrow();
     expect(() => parseImport("omnivore", "{}")).toThrow(/array/);
     expect(() => parseImport("pocket", 'title,url,time_added,tags,status\n"unterminated')).toThrow(
