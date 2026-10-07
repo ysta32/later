@@ -3,7 +3,8 @@ import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { serve } from "@hono/node-server";
 import { serveStatic } from "@hono/node-server/serve-static";
-import { createApp, type Extractor } from "./app.ts";
+import { createApp, type AppDeps, type Extractor } from "./app.ts";
+import { feedIntervalMinutes, startFeedScheduler } from "./scheduler.ts";
 import { openDb } from "./db.ts";
 import { extractFromHtml, fetchAndExtract } from "@later/core/extract";
 
@@ -24,8 +25,10 @@ const extractor: Extractor = {
   extractFromHtml: (html, url) => extractFromHtml(html, url),
 };
 
+const feedIntervalMin = feedIntervalMinutes(env.LATER_FEED_INTERVAL_MIN);
+
 const db = openDb(dataDir);
-const app = createApp({
+const deps: AppDeps = {
   db,
   extract: extractor,
   config: {
@@ -34,8 +37,12 @@ const app = createApp({
     inboundSecret: env.LATER_INBOUND_SECRET || null,
     publicUrl,
     smtpUrl: env.SMTP_URL || null,
+    mailFrom: env.LATER_MAIL_FROM || null,
+    allowPrivateFetch: allowPrivate,
   },
-});
+};
+const app = createApp(deps);
+const stopScheduler = startFeedScheduler(deps, feedIntervalMin);
 
 // Static web app (if built), with SPA fallback to index.html for non-/api paths.
 const webDist = fileURLToPath(new URL("../../web/dist", import.meta.url));
@@ -55,6 +62,7 @@ const server = serve({ fetch: app.fetch, port }, (info) => {
 });
 
 function shutdown() {
+  stopScheduler();
   server.close();
   db.close();
   process.exit(0);

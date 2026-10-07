@@ -1,6 +1,6 @@
 import { randomBytes } from "node:crypto";
 import { newId } from "@later/core";
-import type { Article, ArticleState, CaptureSource, Extracted, Highlight, User } from "@later/core";
+import type { Article, ArticleState, CaptureSource, Extracted, Feed, Highlight, User } from "@later/core";
 import { tx, type Db } from "./db.ts";
 import { hashToken, newToken, SESSION_DAYS } from "./auth.ts";
 
@@ -39,6 +39,8 @@ export interface SaveOptions {
   savedAt?: string | null;
   state?: ArticleState;
   favorite?: boolean;
+  /** When `extracted` is null, insert a new article as "pending" (to be fetched later) instead of "failed". */
+  pending?: boolean;
 }
 
 export interface ArticlePatch {
@@ -166,6 +168,17 @@ function rowToArticle(r: Row, tags: string[]): Article {
     captureError: strOrNull(r.capture_error),
     tags,
     summary: strOrNull(r.summary),
+  };
+}
+
+function rowToFeed(r: Row): Feed {
+  return {
+    id: str(r.id),
+    userId: str(r.user_id),
+    url: str(r.url),
+    title: str(r.title),
+    lastFetchedAt: strOrNull(r.last_fetched_at),
+    lastError: strOrNull(r.last_error),
   };
 }
 
@@ -388,8 +401,8 @@ export class Repo {
             opts.state ?? "inbox",
             opts.favorite ? 1 : 0,
             opts.source,
-            extracted ? "ok" : "failed",
-            extracted ? null : (opts.captureError ?? "capture failed"),
+            extracted ? "ok" : opts.pending ? "pending" : "failed",
+            extracted || opts.pending ? null : (opts.captureError ?? "capture failed"),
           );
       }
       if (opts.tags && opts.tags.length) {
@@ -622,6 +635,7 @@ export class Repo {
           created,
           created,
         );
+      this.touchArticle(userId, articleId);
       return this.getHighlight(userId, id);
     });
   }
@@ -643,15 +657,106 @@ export class Repo {
     }
     sets.push("updated_at = ?");
     params.push(nowIso());
-    const r = this.db
-      .prepare(`UPDATE highlights SET ${sets.join(", ")} WHERE id = ? AND user_id = ?`)
-      .run(...params, id, userId);
-    return Number(r.changes) > 0 ? this.getHighlight(userId, id) : null;
+    return tx(this.db, () => {
+      const r = this.db
+        .prepare(`UPDATE highlights SET ${sets.join(", ")} WHERE id = ? AND user_id = ?`)
+        .run(...params, id, userId);
+      if (Number(r.changes) === 0) return null;
+      const h = this.getHighlight(userId, id);
+      if (h) this.touchArticle(userId, h.articleId);
+      return h;
+    });
   }
 
   deleteHighlight(userId: string, id: string): boolean {
-    const r = this.db.prepare("DELETE FROM highlights WHERE id = ? AND user_id = ?").run(id, userId);
+    return tx(this.db, () => {
+      const h = this.getHighlight(userId, id);
+      if (!h) return false;
+      const r = this.db.prepare("DELETE FROM highlights WHERE id = ? AND user_id = ?").run(id, userId);
+      if (Number(r.changes) > 0) this.touchArticle(userId, h.articleId);
+      return Number(r.changes) > 0;
+    });
+  }
+
+  /** Bump an article's updated_at (e.g. when its highlights change) so sync clients pick it up. */
+  private touchArticle(userId: string, articleId: string): void {
+    this.db
+      .prepare("UPDATE articles SET updated_at = ? WHERE id = ? AND user_id = ?")
+      .run(nowIso(), articleId, userId);
+  }
+
+  /** Full articles (with content) updated strictly after `since` (ISO), oldest first; all when since is null. */
+  articlesUpdatedSince(userId: string, since: string | null): Article[] {
+    const rows = (
+      since
+        ? this.db
+            .prepare("SELECT * FROM articles WHERE user_id = ? AND updated_at > ? ORDER BY updated_at, id")
+            .all(userId, since)
+        : this.db.prepare("SELECT * FROM articles WHERE user_id = ? ORDER BY updated_at, id").all(userId)
+    ) as Row[];
+    return this.hydrate(rows);
+  }
+
+  // ---------- feeds ----------
+  listFeeds(userId: string): Feed[] {
+    const rows = this.db
+      .prepare("SELECT * FROM feeds WHERE user_id = ? ORDER BY title COLLATE NOCASE, id")
+      .all(userId) as Row[];
+    return rows.map(rowToFeed);
+  }
+
+  getFeed(userId: string, id: string): Feed | null {
+    const r = this.db.prepare("SELECT * FROM feeds WHERE id = ? AND user_id = ?").get(id, userId) as
+      Row | undefined;
+    return r ? rowToFeed(r) : null;
+  }
+
+  getFeedByUrl(userId: string, url: string): Feed | null {
+    const r = this.db.prepare("SELECT * FROM feeds WHERE user_id = ? AND url = ?").get(userId, url) as
+      Row | undefined;
+    return r ? rowToFeed(r) : null;
+  }
+
+  /** Insert a feed; returns the existing one (created=false) if the user already follows this URL. */
+  addFeed(userId: string, url: string, title: string): { feed: Feed; created: boolean } {
+    return tx(this.db, () => {
+      const existing = this.getFeedByUrl(userId, url);
+      if (existing) return { feed: existing, created: false };
+      const id = newId();
+      this.db
+        .prepare("INSERT INTO feeds (id, user_id, url, title) VALUES (?, ?, ?, ?)")
+        .run(id, userId, url, title.slice(0, 500) || urlTitle(url));
+      return { feed: this.getFeed(userId, id) as Feed, created: true };
+    });
+  }
+
+  deleteFeed(userId: string, id: string): boolean {
+    const r = this.db.prepare("DELETE FROM feeds WHERE id = ? AND user_id = ?").run(id, userId);
     return Number(r.changes) > 0;
+  }
+
+  /** Record a fetch attempt (title only replaced when a non-empty one is given). */
+  updateFeedFetch(userId: string, id: string, p: { title?: string | null; error: string | null }): void {
+    this.db
+      .prepare(
+        `UPDATE feeds SET last_fetched_at = ?, last_error = ?, title = COALESCE(NULLIF(?, ''), title)
+         WHERE id = ? AND user_id = ?`,
+      )
+      .run(nowIso(), p.error, (p.title ?? "").slice(0, 500), id, userId);
+  }
+
+  /** Atomically claim a feed item guid; true if it was not seen before. */
+  markFeedSeen(feedId: string, guid: string): boolean {
+    const r = this.db
+      .prepare("INSERT OR IGNORE INTO feed_seen (feed_id, guid) VALUES (?, ?)")
+      .run(feedId, guid);
+    return Number(r.changes) > 0;
+  }
+
+  /** Ids of users that follow at least one feed. */
+  feedUserIds(): string[] {
+    const rows = this.db.prepare("SELECT DISTINCT user_id FROM feeds").all() as Row[];
+    return rows.map((r) => str(r.user_id));
   }
 
   listAllHighlights(userId: string): HighlightWithArticle[] {
