@@ -1,0 +1,21 @@
+{
+  "name": "later-monorepo",
+  "private": true,
+  "type": "module",
+  "workspaces": ["packages/*", "apps/*"],
+  "engines": { "node": ">=22.13" },
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "dev": "node apps/server/src/index.ts",
+    "build": "npm run build -w apps/web && npm run build -w apps/site"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4",
+    "prettier": "^3.6.2",
+    "@types/node": "^24.3.0"
+  }
+}

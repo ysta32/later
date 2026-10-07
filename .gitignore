@@ -1,0 +1,10 @@
+node_modules/
+dist/
+*.db
+*.db-*
+data/
+.env
+.env.*
+.orch/
+.vercel/
+coverage/
