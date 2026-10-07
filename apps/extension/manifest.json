@@ -1,0 +1,22 @@
+{
+  "manifest_version": 3,
+  "name": "Later",
+  "version": "0.1.0",
+  "description": "Save pages and their rendered content to Later.",
+  "permissions": ["activeTab", "scripting", "storage", "contextMenus"],
+  "optional_host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "src/background.js",
+    "scripts": ["src/background.js"],
+    "type": "module"
+  },
+  "action": { "default_title": "Save to Later", "default_popup": "src/popup.html" },
+  "options_ui": { "page": "src/options.html", "open_in_tab": true },
+  "commands": {
+    "save-to-later": {
+      "suggested_key": { "default": "Alt+Shift+L" },
+      "description": "Save to Later"
+    }
+  },
+  "browser_specific_settings": { "gecko": { "id": "later@ysta32", "strict_min_version": "128.0" } }
+}

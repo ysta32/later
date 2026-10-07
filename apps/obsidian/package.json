@@ -1,0 +1,10 @@
+{
+  "name": "@later/obsidian",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "esbuild main.ts --bundle --external:obsidian --platform=browser --format=cjs --outfile=main.js",
+    "typecheck": "tsc --noEmit --strict --target ES2022 --module ESNext --moduleResolution bundler main.ts obsidian.d.ts"
+  }
+}
