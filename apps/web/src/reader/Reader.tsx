@@ -6,7 +6,7 @@ import { cssVars, loadSettings, saveSettings, SIZE_RANGE, LINE_HEIGHT_RANGE } fr
 import type { TypographySettings } from "./typography.ts";
 import { applyHighlights, removeHighlight, selectionAnchor } from "./highlight.ts";
 import type { HighlightColor } from "./highlight.ts";
-import { createTts, ttsSupported } from "./tts.ts";
+import { createTts, speakableBlocks, ttsSupported } from "./tts.ts";
 import type { TtsController, TtsState } from "./tts.ts";
 import { createProgressTracker, scrollFraction, sendProgressKeepalive } from "./progress.ts";
 import "./reader.css";
@@ -54,6 +54,12 @@ export default function Reader({ id, onClose, loadOffline }: Props) {
   const bodyRef = useRef<HTMLDivElement>(null);
   const ttsRef = useRef<TtsController | null>(null);
   const lastScroll = useRef(0);
+  const lastFraction = useRef(0);
+  const activeId = useRef(id);
+  const blocksRef = useRef<{ el: Element; text: string }[]>([]);
+  const [voiceUri, setVoiceUri] = useState<string | null>(null);
+  const [noting, setNoting] = useState(false);
+  const [noteText, setNoteText] = useState("");
   const trackerRef = useRef<ReturnType<typeof createProgressTracker> | null>(null);
 
   const flash = (m: string) => {
@@ -64,8 +70,18 @@ export default function Reader({ id, onClose, loadOffline }: Props) {
   // load article (network, falling back to offline cache)
   useEffect(() => {
     let live = true;
+    activeId.current = id;
     setArticle(null);
     setError(null);
+    setHighlights([]);
+    setSummary(null);
+    setSummaryBusy(false);
+    setPanel(null);
+    setSel(null);
+    setEditing(null);
+    setNoting(false);
+    ttsRef.current?.stop();
+    ttsRef.current = null;
     (async () => {
       try {
         const a = await api.get(id);
@@ -114,37 +130,54 @@ export default function Reader({ id, onClose, loadOffline }: Props) {
     );
   }, [article, highlights]);
 
-  // restore scroll once per article
+  // restore scroll once per article; re-apply while content grows (images) until the user scrolls
   useEffect(() => {
     const el = scrollRef.current;
+    const body = bodyRef.current;
     if (!el || !article) return;
-    const t = requestAnimationFrame(() => {
+    let userMoved = false;
+    lastFraction.current = article.progress;
+    const restore = () => {
+      if (userMoved || article.progress <= 0) return;
       el.scrollTop = article.progress * (el.scrollHeight - el.clientHeight);
-    });
-    trackerRef.current = createProgressTracker((f) => {
-      api.update(id, { progress: f }).catch(() => {});
-    }, article.progress);
-    const unload = () => {
-      const f = scrollFraction(el);
-      if (Math.abs(f - article.progress) > 0.001) sendProgressKeepalive(id, f);
     };
+    const moved = () => {
+      userMoved = true;
+    };
+    const userEvents = ["wheel", "touchstart", "pointerdown", "keydown"];
+    for (const ev of userEvents) el.addEventListener(ev, moved, { passive: true });
+    const t = requestAnimationFrame(restore);
+    const ro = typeof ResizeObserver !== "undefined" ? new ResizeObserver(restore) : null;
+    if (body) ro?.observe(body);
+    body?.addEventListener("load", restore, true);
+    const persist = (f: number) => {
+      api.update(id, { progress: f }).catch(() => {});
+    };
+    const tracker = createProgressTracker(persist, article.progress);
+    trackerRef.current = tracker;
+    // always compare against the last persisted value, not the value at open
+    const unload = () => tracker.sendNow(lastFraction.current, (f) => sendProgressKeepalive(id, f));
     window.addEventListener("pagehide", unload);
     return () => {
       cancelAnimationFrame(t);
+      ro?.disconnect();
+      body?.removeEventListener("load", restore, true);
+      for (const ev of userEvents) el.removeEventListener(ev, moved);
       window.removeEventListener("pagehide", unload);
-      trackerRef.current?.flush();
-      trackerRef.current?.dispose();
+      tracker.sendNow(lastFraction.current, persist);
+      tracker.dispose();
     };
   }, [article?.id]);
 
   const onScroll = () => {
     const el = scrollRef.current;
     if (!el) return;
-    trackerRef.current?.update(scrollFraction(el));
+    lastFraction.current = scrollFraction(el);
+    trackerRef.current?.update(lastFraction.current);
     const y = el.scrollTop;
     if (Math.abs(y - lastScroll.current) > 8) setBarHidden(y > lastScroll.current && y > 120);
     lastScroll.current = y;
-    setSel(null);
+    if (!noting) setSel(null);
   };
 
   // text selection -> floating menu
@@ -162,15 +195,17 @@ export default function Reader({ id, onClose, loadOffline }: Props) {
     }, 0);
   };
 
-  const addHighlight = async (color: HighlightColor, withNote: boolean) => {
+  const addHighlight = async (color: HighlightColor, note: string | null) => {
     if (!sel) return;
     const { quote, prefix, suffix } = sel;
-    const note = withNote ? window.prompt("Note") : null;
+    const forId = id;
     setSel(null);
+    setNoting(false);
+    setNoteText("");
     window.getSelection()?.removeAllRanges();
     try {
-      const h = await api.addHighlight(id, { quote, prefix, suffix, color, note: note || null });
-      setHighlights((hs) => [...hs, h]);
+      const h = await api.addHighlight(forId, { quote, prefix, suffix, color, note: note?.trim() || null });
+      if (activeId.current === forId) setHighlights((hs) => [...hs, h]);
     } catch (e) {
       flash(errMsg(e));
     }
@@ -250,26 +285,25 @@ export default function Reader({ id, onClose, loadOffline }: Props) {
       setSummary({ text: article.summary, method: "saved" });
       return;
     }
+    const forId = id;
     setSummaryBusy(true);
     try {
-      const r = await api.summarize(id);
-      setSummary({ text: r.summary, method: r.method });
+      const r = await api.summarize(forId);
+      if (activeId.current === forId) setSummary({ text: r.summary, method: r.method });
     } catch (e) {
-      flash(errMsg(e));
-      setPanel(null);
+      if (activeId.current === forId) {
+        flash(errMsg(e));
+        setPanel(null);
+      }
     } finally {
-      setSummaryBusy(false);
+      if (activeId.current === forId) setSummaryBusy(false);
     }
   };
 
   // TTS
-  const paragraphs = () =>
-    Array.from(
-      bodyRef.current?.querySelectorAll<HTMLElement>("p, h1, h2, h3, h4, h5, h6, li, blockquote") ?? [],
-    ).filter((p) => (p.textContent ?? "").trim());
   const markCurrent = (i: number) => {
     bodyRef.current?.querySelectorAll(".tts-current").forEach((n) => n.classList.remove("tts-current"));
-    const p = paragraphs()[i];
+    const p = blocksRef.current[i]?.el as HTMLElement | undefined;
     if (p) {
       p.classList.add("tts-current");
       p.scrollIntoView({ block: "center", behavior: "smooth" });
@@ -280,9 +314,9 @@ export default function Reader({ id, onClose, loadOffline }: Props) {
       ttsRef.current.state === "paused" ? ttsRef.current.resume() : ttsRef.current.play();
       return;
     }
-    const ps = paragraphs();
+    blocksRef.current = bodyRef.current ? speakableBlocks(bodyRef.current) : [];
     const c = createTts({
-      chunks: ps.map((p) => (p.textContent ?? "").replace(/\s+/g, " ").trim()),
+      chunks: blocksRef.current.map((b) => b.text),
       onChunk: markCurrent,
       onState: (s) => {
         setTts(s);
@@ -292,6 +326,7 @@ export default function Reader({ id, onClose, loadOffline }: Props) {
     });
     ttsRef.current = c;
     c.setRate(rate);
+    c.setVoice(voiceUri);
     c.play();
   };
   const stopTts = () => {
@@ -515,7 +550,12 @@ export default function Reader({ id, onClose, loadOffline }: Props) {
               <span>Voice</span>
               <select
                 class="r-input"
-                onChange={(e) => ttsRef.current?.setVoice(e.currentTarget.value || null)}
+                value={voiceUri ?? ""}
+                onChange={(e) => {
+                  const v = e.currentTarget.value || null;
+                  setVoiceUri(v);
+                  ttsRef.current?.setVoice(v);
+                }}
               >
                 <option value="">Default</option>
                 {voices.map((v) => (
@@ -607,18 +647,53 @@ export default function Reader({ id, onClose, loadOffline }: Props) {
       )}
 
       {sel && (
-        <div class="r-float" style={{ left: sel.x, top: sel.y }} onMouseDown={(e) => e.preventDefault()}>
-          {COLORS.map((c) => (
-            <button
-              class="r-dot"
-              data-color={c}
-              aria-label={`Highlight ${c}`}
-              onClick={() => addHighlight(c, false)}
-            />
-          ))}
-          <button class="r-btn" onClick={() => addHighlight("yellow", true)}>
-            Note
-          </button>
+        <div
+          class={"r-float" + (noting ? " below" : "")}
+          style={{ left: sel.x, top: sel.y }}
+          onMouseDown={(e) => {
+            if (!noting) e.preventDefault();
+          }}
+        >
+          {noting ? (
+            <>
+              <textarea
+                class="r-input"
+                rows={3}
+                placeholder="Add a note"
+                autofocus
+                value={noteText}
+                onInput={(e) => setNoteText(e.currentTarget.value)}
+              />
+              <div class="r-row">
+                <button class="r-btn solid" onClick={() => addHighlight("yellow", noteText)}>
+                  Save
+                </button>
+                <button
+                  class="r-btn"
+                  onClick={() => {
+                    setNoting(false);
+                    setNoteText("");
+                  }}
+                >
+                  Cancel
+                </button>
+              </div>
+            </>
+          ) : (
+            <>
+              {COLORS.map((c) => (
+                <button
+                  class="r-dot"
+                  data-color={c}
+                  aria-label={`Highlight ${c}`}
+                  onClick={() => addHighlight(c, null)}
+                />
+              ))}
+              <button class="r-btn" onClick={() => setNoting(true)}>
+                Note
+              </button>
+            </>
+          )}
         </div>
       )}
       {editing && (

@@ -135,24 +135,24 @@ export function selectionAnchor(
   range: Range,
 ): { quote: string; prefix: string; suffix: string } | null {
   const { segs, text } = textSegments(root);
-  const find = (node: Node, off: number, isEnd: boolean): number => {
+  // Text offset of a DOM boundary point: total length of all text that precedes it.
+  const find = (node: Node, off: number): number => {
     if (node.nodeType === 3) {
       for (const s of segs) if (s.node === node) return s.start + off;
       return -1;
     }
-    // element boundary: resolve to the adjacent child's text
-    const kids = node.childNodes;
-    if (isEnd) {
-      const child = kids[off - 1];
-      const inside = child ? segs.filter((s) => child === s.node || child.contains(s.node)) : [];
-      return inside.length ? inside[inside.length - 1]!.end : -1;
+    const child = node.childNodes[off];
+    let pos = 0;
+    for (const s of segs) {
+      const before = child
+        ? (child.compareDocumentPosition(s.node) & 2) !== 0 // PRECEDING
+        : node.contains(s.node) || (node.compareDocumentPosition(s.node) & 2) !== 0;
+      if (before) pos = s.end;
     }
-    const child = kids[off];
-    const inside = child ? segs.filter((s) => child === s.node || child.contains(s.node)) : [];
-    return inside.length ? inside[0]!.start : -1;
+    return pos;
   };
-  let start = find(range.startContainer, range.startOffset, false);
-  let end = find(range.endContainer, range.endOffset, true);
+  let start = find(range.startContainer, range.startOffset);
+  let end = find(range.endContainer, range.endOffset);
   if (start < 0 || end < 0 || end <= start) return null;
   // trim whitespace
   while (start < end && /\s/.test(text[start]!)) start++;

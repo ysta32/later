@@ -1,6 +1,8 @@
 export interface ProgressTracker {
   update(fraction: number): void;
   flush(): void;
+  /** Send `fraction` now through `sender` (e.g. keepalive on pagehide) unless it equals the last persisted value. */
+  sendNow(fraction: number, sender: (fraction: number) => void): void;
   dispose(): void;
 }
 
@@ -52,6 +54,18 @@ export function createProgressTracker(
         }, delay);
     },
     flush,
+    sendNow(f, sender) {
+      const v = clampFraction(f);
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      pending = null;
+      if (Math.abs(v - lastSent) > 0.001) {
+        lastSent = v;
+        sender(v);
+      }
+    },
     dispose() {
       if (timer) clearTimeout(timer);
       timer = null;

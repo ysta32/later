@@ -55,3 +55,30 @@ describe("progress", () => {
     expect(clampFraction(NaN)).toBe(0);
   });
 });
+
+describe("sendNow", () => {
+  it("compares against the last persisted value, not the opening one", () => {
+    vi.useFakeTimers();
+    const send = vi.fn();
+    const t = createProgressTracker(send, 0.5);
+    t.update(0.8);
+    vi.advanceTimersByTime(3000); // persisted 0.8
+    expect(send).toHaveBeenCalledWith(0.8);
+    const kb = vi.fn();
+    t.sendNow(0.5, kb); // user scrolled back to the opening position: must still be saved
+    expect(kb).toHaveBeenCalledWith(0.5);
+    t.sendNow(0.5, kb);
+    expect(kb).toHaveBeenCalledTimes(1);
+  });
+  it("cancels the pending timer", () => {
+    vi.useFakeTimers();
+    const send = vi.fn(),
+      kb = vi.fn();
+    const t = createProgressTracker(send, 0);
+    t.update(0.3);
+    t.sendNow(0.3, kb);
+    vi.advanceTimersByTime(5000);
+    expect(send).not.toHaveBeenCalled();
+    expect(kb).toHaveBeenCalledTimes(1);
+  });
+});

@@ -99,6 +99,7 @@ export function createTts(opts: TtsOptions): TtsController {
     play(from = 0) {
       session++;
       synth.cancel();
+      synth.resume(); // a prior pause() would otherwise leave the engine paused
       index = Math.max(0, from);
       set("playing");
       speak();
@@ -141,4 +142,30 @@ export function createTts(opts: TtsOptions): TtsController {
       return state;
     },
   };
+}
+
+const BLOCK_SEL = "p, h1, h2, h3, h4, h5, h6, li, blockquote, pre, figcaption";
+
+export interface SpeakBlock<E> {
+  el: E;
+  text: string;
+}
+
+/**
+ * Non-overlapping speakable blocks in document order. A container (li, blockquote) that holds
+ * other blocks contributes only its own text, so nested content is never read twice.
+ */
+export function speakableBlocks<E extends Element>(root: E): SpeakBlock<Element>[] {
+  const out: SpeakBlock<Element>[] = [];
+  for (const el of Array.from(root.querySelectorAll(BLOCK_SEL))) {
+    let text: string;
+    if (el.querySelector(BLOCK_SEL)) {
+      const clone = el.cloneNode(true) as Element;
+      for (const d of Array.from(clone.querySelectorAll(BLOCK_SEL))) d.parentNode?.removeChild(d);
+      text = clone.textContent ?? "";
+    } else text = el.textContent ?? "";
+    text = text.replace(/\s+/g, " ").trim();
+    if (text) out.push({ el, text });
+  }
+  return out;
 }

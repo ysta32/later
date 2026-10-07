@@ -67,3 +67,32 @@ describe("highlight anchoring", () => {
     expect(findQuote(t, "", "", "")).toBe(-1);
   });
 });
+
+import { selectionAnchor } from "./highlight.ts";
+
+describe("selectionAnchor element boundaries", () => {
+  const mk = (html: string) => {
+    const { document } = parseHTML(`<html><body><div id="r">${html}</div></body></html>`);
+    return { document, r: document.getElementById("r")! };
+  };
+  const range = (sc: Node, so: number, ec: Node, eo: number) =>
+    ({ startContainer: sc, startOffset: so, endContainer: ec, endOffset: eo }) as unknown as Range;
+  it("handles a range ending at element offset 0 (triple-click)", () => {
+    const { r } = mk("<p>First para</p><p>Second</p>");
+    const [p1, p2] = Array.from(r.querySelectorAll("p"));
+    const a = selectionAnchor(r, range(p1!.firstChild!, 0, p2!, 0));
+    expect(a!.quote).toBe("First para");
+    expect(a!.suffix).toBe("Second");
+  });
+  it("handles element start and end containers", () => {
+    const { r } = mk("<p>One <b>two</b> three</p>");
+    const p = r.querySelector("p")!;
+    const a = selectionAnchor(r, range(p, 0, p, p.childNodes.length));
+    expect(a!.quote).toBe("One two three");
+  });
+  it("returns null for empty", () => {
+    const { r } = mk("<p>x</p>");
+    const p = r.querySelector("p")!;
+    expect(selectionAnchor(r, range(p, 0, p, 0))).toBeNull();
+  });
+});
