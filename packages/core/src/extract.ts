@@ -1,7 +1,11 @@
 import { Readability } from "@mozilla/readability";
 import { parseHTML } from "linkedom";
 import { lookup as dnsLookup } from "node:dns/promises";
-import { isIP } from "node:net";
+import { isIP, type LookupFunction } from "node:net";
+import http from "node:http";
+import https from "node:https";
+import { Readable } from "node:stream";
+import zlib from "node:zlib";
 import type { Extracted } from "./types.ts";
 import { countWords, htmlToText, sanitizeHtml } from "./sanitize.ts";
 
@@ -214,6 +218,17 @@ function bodyLength(html: string): number {
 const JUNK_SELECTOR =
   "script, style, noscript, template, nav, header, footer, aside, form, iframe, svg, [role=navigation], [aria-hidden=true]";
 
+function documentBase(doc: Document, url: string): string {
+  const b = doc.querySelector("base[href]")?.getAttribute("href");
+  return (b && httpUrl(b, url)) || url;
+}
+
+/** The page's <link rel=amphtml> target (absolute http(s)), if any. */
+function findAmpUrl(html: string, url: string): string | null {
+  const doc = parseDoc(html);
+  return httpUrl(linkHref(doc, "amphtml"), documentBase(doc, url));
+}
+
 function extractInternal(html: string, url: string): InternalResult {
   const doc = parseDoc(html);
 
@@ -224,10 +239,7 @@ function extractInternal(html: string, url: string): InternalResult {
     fallbackHost = "";
   }
 
-  const baseHref = (() => {
-    const b = doc.querySelector("base[href]")?.getAttribute("href");
-    return (b && httpUrl(b, url)) || url;
-  })();
+  const baseHref = documentBase(doc, url);
   const canonical = httpUrl(linkHref(doc, "canonical"), baseHref) ?? httpUrl(meta(doc, "og:url"), baseHref);
   const finalUrl = canonical ?? url;
   const ampUrl = httpUrl(linkHref(doc, "amphtml"), baseHref);
@@ -488,7 +500,13 @@ export function isPrivateIp(ip: string): boolean {
  * Validate that a URL is safe to fetch server-side: http(s) only, no credentials, and (unless
  * allowPrivate) every resolved address is public. Throws ExtractError("fetch") otherwise.
  */
-export async function assertPublicUrl(url: string | URL, opts: UrlPolicyOptions = {}): Promise<URL> {
+export interface ResolvedAddress {
+  address: string;
+  family: number;
+}
+
+/** Synchronous shape checks: parseable, http(s), no credentials. */
+function checkUrlShape(url: string | URL): URL {
   let u: URL;
   try {
     u = new URL(String(url));
@@ -499,7 +517,19 @@ export async function assertPublicUrl(url: string | URL, opts: UrlPolicyOptions 
     throw new ExtractError("fetch", `Unsupported URL scheme: ${u.protocol}`);
   }
   if (u.username || u.password) throw new ExtractError("fetch", "URLs with credentials are not allowed");
-  if (opts.allowPrivate) return u;
+  return u;
+}
+
+/**
+ * Validate a URL and resolve its host. Returns the validated addresses the connection must be
+ * pinned to, or null when no pinning applies (allowPrivate, or an IP-literal host).
+ */
+async function resolvePublic(
+  url: string | URL,
+  opts: UrlPolicyOptions,
+): Promise<{ url: URL; addresses: ResolvedAddress[] | null }> {
+  const u = checkUrlShape(url);
+  if (opts.allowPrivate) return { url: u, addresses: null };
   const host = u.hostname
     .replace(/^\[|\]$/g, "")
     .replace(/\.$/, "")
@@ -510,9 +540,9 @@ export async function assertPublicUrl(url: string | URL, opts: UrlPolicyOptions 
   }
   if (isIP(host)) {
     if (isPrivateIp(host)) throw new ExtractError("fetch", `Blocked non-public address: ${host}`);
-    return u;
+    return { url: u, addresses: null };
   }
-  let addrs: { address: string }[];
+  let addrs: ResolvedAddress[];
   try {
     addrs = await (opts.lookup ?? defaultLookup)(host);
   } catch (err) {
@@ -523,7 +553,108 @@ export async function assertPublicUrl(url: string | URL, opts: UrlPolicyOptions 
     if (isPrivateIp(a.address))
       throw new ExtractError("fetch", `Blocked non-public address for ${host}: ${a.address}`);
   }
-  return u;
+  return {
+    url: u,
+    addresses: addrs.map((a) => ({
+      address: a.address,
+      family: a.family === 6 || isIP(a.address) === 6 ? 6 : 4,
+    })),
+  };
+}
+
+/**
+ * Validate that a URL is safe to fetch server-side: http(s) only, no credentials, and (unless
+ * allowPrivate) every resolved address is public. Throws ExtractError("fetch") otherwise.
+ * Note: callers that then connect by hostname are exposed to DNS rebinding; fetchAndExtract pins.
+ */
+export async function assertPublicUrl(url: string | URL, opts: UrlPolicyOptions = {}): Promise<URL> {
+  return (await resolvePublic(url, opts)).url;
+}
+
+// ---------- pinned transport ----------
+
+export interface RequestInitLite {
+  headers: Record<string, string>;
+  signal: AbortSignal;
+}
+
+/**
+ * GET via node:http(s) with DNS pinned to already-validated addresses (defeats DNS rebinding while
+ * keeping the Host header and TLS SNI/certificate identity of the original hostname). Redirects are
+ * NOT followed. Response bodies are transparently decompressed.
+ */
+export function pinnedRequest(
+  url: string,
+  init: RequestInitLite,
+  addresses: ResolvedAddress[] | null,
+): Promise<Response> {
+  const u = new URL(url);
+  const mod = u.protocol === "https:" ? https : http;
+  const options: https.RequestOptions = {
+    method: "GET",
+    hostname: u.hostname.replace(/^\[|\]$/g, ""),
+    port: u.port || undefined,
+    path: `${u.pathname}${u.search}`,
+    headers: { ...init.headers, "Accept-Encoding": "gzip, deflate, br" },
+    signal: init.signal,
+  };
+  if (addresses && addresses.length) {
+    const pinned = addresses.map((a) => ({ address: a.address, family: a.family }));
+    const lookup = (
+      _hostname: string,
+      opts: { all?: boolean },
+      cb: (err: Error | null, address: string | ResolvedAddress[], family?: number) => void,
+    ): void => {
+      if (opts && opts.all) cb(null, pinned);
+      else cb(null, pinned[0].address, pinned[0].family);
+    };
+    options.lookup = lookup as unknown as LookupFunction;
+  }
+  return new Promise<Response>((resolve, reject) => {
+    const req = mod.request(options, (res) => {
+      const status = res.statusCode ?? 0;
+      if (status < 200 || status > 599) {
+        res.destroy();
+        reject(new Error(`Unexpected HTTP status ${status}`));
+        return;
+      }
+      const headers = new Headers();
+      for (const [k, v] of Object.entries(res.headers)) {
+        if (v === undefined) continue;
+        for (const item of Array.isArray(v) ? v : [v]) headers.append(k, item);
+      }
+      const nullBody = status === 204 || status === 205 || status === 304 || (status >= 300 && status < 400);
+      if (nullBody) {
+        res.resume();
+        resolve(new Response(null, { status, headers }));
+        return;
+      }
+      const enc = (headers.get("content-encoding") ?? "").trim().toLowerCase();
+      let body: Readable = res;
+      if (enc && enc !== "identity") {
+        const decoder =
+          enc === "gzip" || enc === "x-gzip"
+            ? zlib.createGunzip()
+            : enc === "deflate"
+              ? zlib.createInflate()
+              : enc === "br"
+                ? zlib.createBrotliDecompress()
+                : null;
+        if (!decoder) {
+          res.destroy();
+          reject(new Error(`Unsupported content-encoding "${enc}"`));
+          return;
+        }
+        res.on("error", (e) => decoder.destroy(e));
+        body = res.pipe(decoder);
+        headers.delete("content-encoding");
+        headers.delete("content-length");
+      }
+      resolve(new Response(Readable.toWeb(body) as unknown as BodyInit, { status, headers }));
+    });
+    req.on("error", reject);
+    req.end();
+  });
 }
 
 // ---------- fetching ----------
@@ -533,8 +664,14 @@ interface Fetched {
   url: string;
 }
 
+type Transport = (
+  url: string,
+  init: RequestInitLite,
+  addresses: ResolvedAddress[] | null,
+) => Promise<Response>;
+
 interface FetchCtx {
-  fetchImpl: typeof fetch;
+  transport: Transport;
   timeoutMs: number;
   policy: UrlPolicyOptions;
 }
@@ -558,7 +695,7 @@ async function cancelBody(res: Response): Promise<void> {
 }
 
 async function fetchOnce(startUrl: string, ua: string, ctx: FetchCtx): Promise<Fetched> {
-  const { fetchImpl, timeoutMs } = ctx;
+  const { transport, timeoutMs } = ctx;
   const controller = new AbortController();
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<never>((_, reject) => {
@@ -573,18 +710,22 @@ async function fetchOnce(startUrl: string, ua: string, ctx: FetchCtx): Promise<F
     let url = startUrl;
     let res: Response | null = null;
     for (let hop = 0; ; hop++) {
-      const checked = await assertPublicUrl(url, ctx.policy);
-      url = checked.href;
+      // Validation (incl. DNS) runs inside the timeout race; the connection is pinned to its result.
+      const checked = await resolvePublic(url, ctx.policy);
+      url = checked.url.href;
       try {
-        res = await fetchImpl(url, {
-          redirect: "manual",
-          signal: controller.signal,
-          headers: {
-            "User-Agent": ua,
-            Accept: ACCEPT,
-            "Accept-Language": "en-US,en;q=0.9",
+        res = await transport(
+          url,
+          {
+            signal: controller.signal,
+            headers: {
+              "User-Agent": ua,
+              Accept: ACCEPT,
+              "Accept-Language": "en-US,en;q=0.9",
+            },
           },
-        });
+          checked.addresses,
+        );
       } catch (err) {
         if (controller.signal.aborted) throw timedOut(err);
         throw new RetryableError(
@@ -667,15 +808,37 @@ async function fetchHtml(url: string, ctx: FetchCtx): Promise<Fetched> {
 
 /** Fetch a URL server-side and extract readable content. Throws ExtractError on failure. */
 export async function fetchAndExtract(url: string, opts: FetchExtractOptions = {}): Promise<Extracted> {
+  const injected = opts.fetch;
   const ctx: FetchCtx = {
-    fetchImpl: opts.fetch ?? globalThis.fetch,
+    // An injected fetch (tests/custom runtimes) gets manual redirects; the default is the pinned node transport.
+    transport: injected
+      ? (u, init) => injected(u, { redirect: "manual", signal: init.signal, headers: init.headers })
+      : pinnedRequest,
     timeoutMs: opts.timeoutMs ?? 15000,
     policy: { lookup: opts.lookup, allowPrivate: opts.allowPrivate ?? false },
   };
-  const parsed = await assertPublicUrl(url, ctx.policy);
+  // Only cheap synchronous checks here; DNS validation happens inside the timed fetch.
+  const parsed = checkUrlShape(url);
 
   const page = await fetchHtml(parsed.href, ctx);
-  const main = extractInternal(page.html, page.url);
+  let main: InternalResult;
+  try {
+    main = extractInternal(page.html, page.url);
+  } catch (err) {
+    // Empty shell page (e.g. client-rendered): the AMP version may still carry the article.
+    if (!(err instanceof ExtractError) || err.code !== "empty") throw err;
+    const ampUrl = findAmpUrl(page.html, page.url);
+    if (!ampUrl || ampUrl === page.url) throw err;
+    let ampPage: Fetched;
+    try {
+      ampPage = await fetchHtml(ampUrl, ctx);
+    } catch (ampErr) {
+      // Report the primary page's failure; the AMP attempt was only a fallback.
+      if (ampErr instanceof ExtractError) throw err;
+      throw ampErr;
+    }
+    return extractInternal(ampPage.html, ampPage.url).extracted;
+  }
   const weak = main.method !== "readability" && main.method !== "jsonld";
   const short = main.extracted.textContent.length < MIN_CHARS;
   if (main.ampUrl && main.ampUrl !== page.url && (weak || short)) {

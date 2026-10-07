@@ -109,15 +109,44 @@ function absolutize(value: string, base: URL | null): string {
   }
 }
 
+/** Parse a srcset per the HTML candidate-string grammar; commas need not be followed by spaces. */
+export function parseSrcset(srcset: string): { url: string; descriptor: string }[] {
+  const out: { url: string; descriptor: string }[] = [];
+  const s = srcset;
+  let i = 0;
+  while (i < s.length) {
+    while (i < s.length && (/\s/.test(s[i]) || s[i] === ",")) i++;
+    if (i >= s.length) break;
+    let j = i;
+    while (j < s.length && !/\s/.test(s[j])) j++;
+    let url = s.slice(i, j);
+    i = j;
+    let descriptor = "";
+    if (/,+$/.test(url)) {
+      // "a.jpg,b.jpg 2x": trailing commas end the candidate with no descriptor.
+      url = url.replace(/,+$/, "");
+    } else {
+      let depth = 0;
+      while (i < s.length) {
+        const c = s[i];
+        if (c === "(") depth++;
+        else if (c === ")") depth = Math.max(0, depth - 1);
+        else if (c === "," && depth === 0) break;
+        descriptor += c;
+        i++;
+      }
+      descriptor = descriptor.trim().replace(/\s+/g, " ");
+    }
+    if (url) out.push({ url, descriptor });
+  }
+  return out;
+}
+
 function absolutizeSrcset(srcset: string, base: URL | null): string {
-  return srcset
-    .split(/,\s+(?=\S)/)
-    .map((part) => {
-      const [u, ...desc] = part.trim().split(/\s+/);
-      if (!u) return "";
-      return [absolutize(u, base), ...desc].join(" ");
-    })
-    .filter(Boolean)
+  return parseSrcset(srcset)
+    .map(({ url, descriptor }) =>
+      descriptor ? `${absolutize(url, base)} ${descriptor}` : absolutize(url, base),
+    )
     .join(", ");
 }
 
@@ -161,8 +190,8 @@ function fixLazyAttribs(attribs: Record<string, string>): Record<string, string>
   }
   // If src is still a placeholder but a real srcset exists, use its first candidate.
   if (isPlaceholderSrc(out.src) && out.srcset && !isPlaceholderSrc(out.srcset)) {
-    const first = out.srcset.trim().split(/\s+/)[0];
-    if (first) out.src = first.replace(/,$/, "");
+    const first = parseSrcset(out.srcset)[0]?.url;
+    if (first) out.src = first;
   }
   return out;
 }

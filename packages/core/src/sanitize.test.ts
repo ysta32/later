@@ -81,6 +81,19 @@ describe("sanitizeHtml", () => {
     expect(out).not.toContain("nothing");
   });
 
+  it("absolutizes every srcset candidate, with or without spaces after commas", () => {
+    const out = sanitizeHtml(
+      `<img src="/a.jpg" srcset="/a.jpg 1x,/b.jpg 2x"><img src="/c.jpg" srcset="/c.jpg 480w,/d.jpg 800w">
+       <img src="/e.jpg" srcset="https://img.example/w_100,h_50/e.jpg 100w, f.jpg 200w">`,
+      BASE,
+    );
+    expect(out).toContain('srcset="https://example.com/a.jpg 1x, https://example.com/b.jpg 2x"');
+    expect(out).toContain('srcset="https://example.com/c.jpg 480w, https://example.com/d.jpg 800w"');
+    expect(out).toContain(
+      'srcset="https://img.example/w_100,h_50/e.jpg 100w, https://example.com/blog/f.jpg 200w"',
+    );
+  });
+
   it("does not let data: URLs through links", () => {
     const out = sanitizeHtml(`<a href="data:text/html,<script>alert(1)</script>">x</a>`, BASE);
     expect(out).not.toContain("data:");

@@ -1,11 +1,14 @@
 import { readFileSync } from "node:fs";
-import { describe, expect, it } from "vitest";
+import { createServer, type IncomingHttpHeaders, type Server } from "node:http";
+import { gzipSync } from "node:zlib";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   assertPublicUrl,
   ExtractError,
   extractFromHtml,
   fetchAndExtract,
   isPrivateIp,
+  pinnedRequest,
   type LookupFn,
 } from "./extract.ts";
 
@@ -345,5 +348,91 @@ describe("SSRF policy", () => {
     function blog(): string {
       return fx("blog.html");
     }
+  });
+});
+
+describe("fix round regressions", () => {
+  it("DNS validation is inside the timeout", async () => {
+    const hang: LookupFn = () => new Promise(() => undefined);
+    const f = fakeFetch({});
+    const t0 = Date.now();
+    expect(
+      await codeOf(fetchAndExtract("https://slowdns.example/", { fetch: f, lookup: hang, timeoutMs: 50 })),
+    ).toBe("fetch");
+    expect(Date.now() - t0).toBeLessThan(2000);
+    expect(f.calls.length).toBe(0);
+  });
+
+  it("empty main page still falls back to AMP", async () => {
+    const shell = `<html><head><title>T</title><link rel="amphtml" href="/a.amp"></head><body><div id="app"></div><script>x()</script></body></html>`;
+    const f = fakeFetch({
+      "https://spa.example/a": () => html(shell),
+      "https://spa.example/a.amp": () => html(fx("blog.html")),
+    });
+    const r = await fetchAndExtract("https://spa.example/a", { fetch: f, lookup: publicLookup });
+    expect(r.textContent).toContain("Plain text survives every migration");
+    const g = fakeFetch({ "https://spa.example/a": () => html(shell) });
+    expect(await codeOf(fetchAndExtract("https://spa.example/a", { fetch: g, lookup: publicLookup }))).toBe(
+      "empty",
+    );
+  });
+
+  describe("pinned node transport", () => {
+    let server: Server;
+    let port = 0;
+    const seen: IncomingHttpHeaders[] = [];
+    beforeAll(async () => {
+      server = createServer((req, res) => {
+        seen.push(req.headers);
+        if (req.url === "/redir") {
+          res.writeHead(302, { location: "/gz" });
+          res.end();
+        } else if (req.url === "/gz") {
+          res.writeHead(200, { "content-type": "text/html; charset=utf-8", "content-encoding": "gzip" });
+          res.end(gzipSync(fx("blog.html")));
+        } else {
+          res.writeHead(200, { "content-type": "text/plain" });
+          res.end("pinned ok");
+        }
+      });
+      for (let p = 4870; p < 4900 && !port; p++) {
+        try {
+          await new Promise<void>((resolve, reject) => {
+            server.once("error", reject);
+            server.listen(p, "127.0.0.1", () => {
+              server.off("error", reject);
+              resolve();
+            });
+          });
+          port = p;
+        } catch {
+          // port busy; try the next one in the allowed 4800-4899 range
+        }
+      }
+      if (!port) throw new Error("no free port in 4870-4899");
+    });
+    afterAll(() => new Promise<void>((r) => server.close(() => r())));
+
+    it("connects to the pinned address without re-resolving, keeping the Host header", async () => {
+      // ".invalid" never resolves in DNS: success proves the connection used the pinned address.
+      const res = await pinnedRequest(
+        `http://rebind.invalid:${port}/plain`,
+        { headers: { "User-Agent": "t" }, signal: new AbortController().signal },
+        [{ address: "127.0.0.1", family: 4 }],
+      );
+      expect(res.status).toBe(200);
+      expect(await res.text()).toBe("pinned ok");
+      expect(seen.at(-1)?.host).toBe(`rebind.invalid:${port}`);
+    });
+
+    it("default transport follows redirects manually and decompresses gzip", async () => {
+      const r = await fetchAndExtract(`http://127.0.0.1:${port}/redir`, { allowPrivate: true });
+      expect(r.title).toBe("Why Plain Text Wins");
+      expect(seen.at(-1)?.["accept-encoding"]).toContain("gzip");
+    });
+
+    it("default transport still blocks private targets without allowPrivate", async () => {
+      expect(await codeOf(fetchAndExtract(`http://127.0.0.1:${port}/plain`))).toBe("fetch");
+    });
   });
 });
