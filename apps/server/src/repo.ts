@@ -519,6 +519,10 @@ export class Repo {
     return Number(r.changes) > 0;
   }
 
+  /**
+   * Replace an article's tags. Tags are case-insensitive (NOCASE); casing is canonical per user:
+   * the casing of the user's existing tag wins (first-seen), so every row of a tag shares one spelling.
+   */
   setTags(userId: string, articleId: string, tags: string[]): boolean {
     return tx(this.db, () => {
       const owned = this.db
@@ -527,7 +531,14 @@ export class Repo {
       if (!owned) return false;
       this.db.prepare("DELETE FROM article_tags WHERE article_id = ?").run(articleId);
       const ins = this.db.prepare("INSERT OR IGNORE INTO article_tags (article_id, tag) VALUES (?, ?)");
-      for (const t of normalizeTags(tags)) ins.run(articleId, t);
+      const canon = this.db.prepare(
+        `SELECT t.tag FROM article_tags t JOIN articles a ON a.id = t.article_id
+         WHERE a.user_id = ? AND t.tag = ? ORDER BY t.rowid LIMIT 1`,
+      );
+      for (const t of normalizeTags(tags)) {
+        const existing = canon.get(userId, t) as Row | undefined;
+        ins.run(articleId, existing ? str(existing.tag) : t);
+      }
       return true;
     });
   }
@@ -535,8 +546,8 @@ export class Repo {
   tagCounts(userId: string): { tag: string; count: number }[] {
     const rows = this.db
       .prepare(
-        `SELECT MIN(t.tag) AS tag, COUNT(*) AS count FROM article_tags t JOIN articles a ON a.id = t.article_id
-         WHERE a.user_id = ? GROUP BY t.tag COLLATE NOCASE ORDER BY count DESC, tag COLLATE NOCASE`,
+        `SELECT MIN(t.tag COLLATE BINARY) AS tag, COUNT(*) AS count FROM article_tags t JOIN articles a ON a.id = t.article_id
+         WHERE a.user_id = ? GROUP BY t.tag COLLATE NOCASE ORDER BY count DESC, tag COLLATE NOCASE, tag COLLATE BINARY`,
       )
       .all(userId) as Row[];
     return rows.map((r) => ({ tag: str(r.tag), count: Number(r.count) }));

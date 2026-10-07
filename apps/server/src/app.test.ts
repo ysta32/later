@@ -663,6 +663,26 @@ describe("articles", () => {
       { tag: "b", count: 1 },
     ]);
   });
+
+  it("tag casing is canonical per user (first-seen wins) and isolated between users", async () => {
+    const one = await save(tok, { url: "https://e.com/c1", tags: ["Rust Lang"] });
+    expect(one.json.tags).toEqual(["Rust Lang"]);
+    const two = await save(tok, { url: "https://e.com/c2", tags: ["rust   LANG"] });
+    expect(two.json.tags).toEqual(["Rust Lang"]);
+    const p = await call("PATCH", `/api/articles/${two.json.id}`, {
+      token: tok,
+      body: { tags: ["RUST LANG", "new"] },
+    });
+    expect(p.json.tags).toEqual(["new", "Rust Lang"]);
+    expect((await call("GET", "/api/tags", { token: tok })).json.tags).toEqual([
+      { tag: "Rust Lang", count: 2 },
+      { tag: "new", count: 1 },
+    ]);
+    // another user's casing is independent
+    const other = await signup("b@x.io");
+    const b = await save(other.token, { url: "https://e.com/c1", tags: ["rust lang"] });
+    expect(b.json.tags).toEqual(["rust lang"]);
+  });
 });
 
 describe("highlights", () => {
