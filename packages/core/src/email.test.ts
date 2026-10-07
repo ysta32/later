@@ -102,7 +102,7 @@ describe("parseInbound", () => {
       title: "Today's news",
       author: "Daily News",
       siteName: "example.com",
-      textContent: "Welcome The latest news is here.",
+      textContent: "Welcome\n\nThe latest news is here.",
       wordCount: 6,
       leadImage: null,
       publishedAt: null,
@@ -121,8 +121,8 @@ describe("parseInbound", () => {
     expect(result.extracted).toMatchObject({
       author: null,
       siteName: "example.com",
-      wordCount: 8,
-      textContent: "Hello <reader> & friends. Second paragraph. Next line.",
+      wordCount: 7,
+      textContent: "Hello <reader> & friends.\n\nSecond paragraph.\n\nNext line.",
     });
     expect(result.extracted?.contentHtml).toContain("&lt;reader&gt; &amp; friends.");
     expect(result.extracted?.contentHtml).toContain("</p><p>");
