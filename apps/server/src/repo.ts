@@ -328,8 +328,9 @@ export class Repo {
 
   findArticleByUrl(userId: string, url: string): Article | null {
     if (!url) return null;
-    const r = this.db.prepare("SELECT * FROM articles WHERE user_id = ? AND url = ?").get(userId, url) as
-      Row | undefined;
+    const r = this.db
+      .prepare("SELECT * FROM articles WHERE user_id = ? AND url = ? AND url <> ''")
+      .get(userId, url) as Row | undefined;
     return r ? this.hydrate([r])[0] : null;
   }
 

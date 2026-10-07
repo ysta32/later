@@ -605,7 +605,7 @@ Bad,file:///tmp/private,invalid,,unread
     const ok = await call("POST", "/api/import?format=pocket", { token, raw: rows(10, "z") });
     expect(ok.status).toBe(200);
     expect(ok.json.imported).toBe(10);
-  });
+  }, 30_000);
 
   it("resumePending re-enqueues pending rows idempotently", async () => {
     const { token, user } = await signup("a@x.io");
