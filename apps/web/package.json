@@ -1,0 +1,1 @@
+{"name":"@later/web","version":"0.1.0","type":"module","private":true,"scripts":{"dev":"vite --port 4810 --strictPort","build":"vite build"},"devDependencies":{"@preact/preset-vite":"^2.10.6","vite":"^7.3.7"}}

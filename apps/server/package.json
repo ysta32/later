@@ -1,3 +1,1 @@
-{ "name": "@later/server", "version": "0.1.0", "type": "module", "private": true,
-  "scripts": { "start": "node src/index.ts" },
-  "dependencies": { "@later/core": "*" } }
+{"name":"@later/server","version":"0.1.0","type":"module","private":true,"scripts":{"start":"node src/index.ts"},"dependencies":{"@hono/node-server":"^1.19.17","@later/core":"*","hono":"^4.13.13","nodemailer":"^10.0.16"}}
