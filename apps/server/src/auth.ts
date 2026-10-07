@@ -71,43 +71,60 @@ export function normalizeEmail(v: unknown): string | null {
   return e;
 }
 
-/** In-memory fixed-window limiter for failed login attempts, keyed by IP+email. */
-export class LoginLimiter {
+/**
+ * In-memory fixed-window rate limiter. `attempt()` reserves a slot synchronously *before* any
+ * async work (so concurrent requests cannot all slip past the check); `refund()` gives it back
+ * (e.g. on successful login).
+ */
+export class RateLimiter {
   private hits = new Map<string, { count: number; resetAt: number }>();
   private max: number;
   private windowMs: number;
-  constructor(max = 10, windowMs = 15 * 60 * 1000) {
+  constructor(max: number, windowMs: number) {
     this.max = max;
     this.windowMs = windowMs;
   }
-  private key(ip: string, email: string): string {
-    return `${ip}\u0000${email}`;
-  }
-  blocked(ip: string, email: string, now = Date.now()): boolean {
-    const h = this.hits.get(this.key(ip, email));
-    if (!h) return false;
-    if (h.resetAt <= now) {
-      this.hits.delete(this.key(ip, email));
-      return false;
+  /** Reserve one attempt for `key`; returns false (and reserves nothing) when the limit is reached. */
+  attempt(key: string, now = Date.now()): boolean {
+    const h = this.hits.get(key);
+    if (!h || h.resetAt <= now) {
+      this.hits.set(key, { count: 1, resetAt: now + this.windowMs });
+      if (this.hits.size > 10_000) this.prune(now);
+      return true;
     }
-    return h.count >= this.max;
+    if (h.count >= this.max) return false;
+    h.count++;
+    return true;
   }
-  fail(ip: string, email: string, now = Date.now()): void {
-    const k = this.key(ip, email);
-    const h = this.hits.get(k);
-    if (!h || h.resetAt <= now) this.hits.set(k, { count: 1, resetAt: now + this.windowMs });
-    else h.count++;
-    if (this.hits.size > 10_000) this.prune(now);
-  }
-  reset(ip: string, email: string): void {
-    this.hits.delete(this.key(ip, email));
+  /** Return one previously reserved attempt. */
+  refund(key: string, now = Date.now()): void {
+    const h = this.hits.get(key);
+    if (!h || h.resetAt <= now) return;
+    h.count = Math.max(0, h.count - 1);
   }
   private prune(now: number): void {
     for (const [k, h] of this.hits) if (h.resetAt <= now) this.hits.delete(k);
-    // Still too big (attack with many keys): drop oldest entries (Map preserves insertion order).
+    // Still too big (many distinct keys): drop oldest entries (Map preserves insertion order).
     for (const k of this.hits.keys()) {
       if (this.hits.size <= 10_000) break;
       this.hits.delete(k);
     }
   }
+}
+
+export interface Limiters {
+  /** Login attempts per IP+email (successful logins are refunded). */
+  login: RateLimiter;
+  /** Signup attempts per IP. */
+  signup: RateLimiter;
+  /** API token creation per IP. */
+  tokens: RateLimiter;
+}
+
+export function createLimiters(): Limiters {
+  return {
+    login: new RateLimiter(10, 15 * 60_000),
+    signup: new RateLimiter(10, 60 * 60_000),
+    tokens: new RateLimiter(20, 60 * 60_000),
+  };
 }

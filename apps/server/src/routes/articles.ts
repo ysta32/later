@@ -1,12 +1,10 @@
 import { Hono } from "hono";
-import { bodyLimit } from "hono/body-limit";
 import { HTTPException } from "hono/http-exception";
 import type { ArticleState, CaptureSource, Extracted } from "@later/core";
 import { badRequest, readJson, requireAuth, type AppEnv } from "../app.ts";
 import { CAPTURE_SOURCES, normalizeTags, type ArticlePatch } from "../repo.ts";
 
 const MAX_URL = 4096;
-const MAX_BODY = 20 * 1024 * 1024;
 
 /** Validate and normalize an article URL (http/https only, fragment dropped). */
 export function normalizeUrl(v: unknown): string | null {
@@ -20,6 +18,7 @@ export function normalizeUrl(v: unknown): string | null {
     return null;
   }
   if (u.protocol !== "http:" && u.protocol !== "https:") return null;
+  if (u.username || u.password) return null;
   u.hash = "";
   return u.href;
 }
@@ -62,64 +61,55 @@ export function articleRoutes(): Hono<AppEnv> {
     }
   });
 
-  r.post(
-    "/articles",
-    requireAuth,
-    bodyLimit({ maxSize: MAX_BODY, onError: (c) => c.json({ error: "request body too large" }, 413) }),
-    async (c) => {
-      const repo = c.get("repo");
-      const { extract } = c.get("deps");
-      const userId = c.get("user").id;
-      const body = await readJson(c);
-      const url = normalizeUrl(body.url);
-      if (!url) badRequest("a valid http(s) url is required");
-      const html = body.html;
-      if (html !== undefined && html !== null && typeof html !== "string")
-        badRequest("html must be a string");
-      const title = typeof body.title === "string" ? body.title.trim().slice(0, 1000) || null : null;
-      const tags = parseTags(body.tags);
-      let source: CaptureSource;
-      if (body.source === undefined || body.source === null) source = html ? "extension" : "server";
-      else if (
-        typeof body.source === "string" &&
-        (CAPTURE_SOURCES as readonly string[]).includes(body.source)
-      )
-        source = body.source as CaptureSource;
-      else badRequest("invalid source");
+  r.post("/articles", requireAuth, async (c) => {
+    const repo = c.get("repo");
+    const { extract } = c.get("deps");
+    const userId = c.get("user").id;
+    const body = await readJson(c);
+    const url = normalizeUrl(body.url);
+    if (!url) badRequest("a valid http(s) url is required");
+    const html = body.html;
+    if (html !== undefined && html !== null && typeof html !== "string") badRequest("html must be a string");
+    const title = typeof body.title === "string" ? body.title.trim().slice(0, 1000) || null : null;
+    const tags = parseTags(body.tags);
+    let source: CaptureSource;
+    if (body.source === undefined || body.source === null) source = html ? "extension" : "server";
+    else if (typeof body.source === "string" && (CAPTURE_SOURCES as readonly string[]).includes(body.source))
+      source = body.source as CaptureSource;
+    else badRequest("invalid source");
 
-      // Duplicate without new DOM: return the existing article (merging tags) unless its capture failed (then retry).
-      if (!html) {
-        const existing = repo.findArticleByUrl(userId, url);
-        if (existing && existing.captureStatus !== "failed") {
-          if (tags?.length) repo.setTags(userId, existing.id, normalizeTags([...existing.tags, ...tags]));
-          return c.json(repo.getArticle(userId, existing.id), 200);
-        }
+    // Duplicate without new DOM: return the existing article (merging tags) unless its capture failed (then retry).
+    if (!html) {
+      const existing = repo.findArticleByUrl(userId, url);
+      if (existing && existing.captureStatus !== "failed") {
+        if (tags?.length) repo.setTags(userId, existing.id, normalizeTags([...existing.tags, ...tags]));
+        return c.json(repo.getArticle(userId, existing.id), 200);
       }
+    }
 
-      let extracted: Extracted | null = null;
-      let captureError: string | null = null;
-      if (html) {
-        try {
-          extracted = extract.extractFromHtml(html, url);
-        } catch (err) {
-          captureError = errMessage(err);
-        }
+    let extracted: Extracted | null = null;
+    let captureError: string | null = null;
+    if (html) {
+      try {
+        extracted = extract.extractFromHtml(html, url);
+      } catch (err) {
+        captureError = errMessage(err);
       }
-      if (!extracted) {
-        try {
-          extracted = await extract.fetchAndExtract(url);
-          captureError = null;
-        } catch (err) {
-          captureError = captureError ? `${captureError}; fetch: ${errMessage(err)}` : errMessage(err);
-        }
+    }
+    if (!extracted) {
+      try {
+        extracted = await extract.fetchAndExtract(url);
+        captureError = null;
+      } catch (err) {
+        captureError = captureError ? `${captureError}; fetch: ${errMessage(err)}` : errMessage(err);
       }
+    }
 
-      // Synchronous from here: existence check and upsert cannot interleave with another request.
-      const existed = repo.findArticleByUrl(userId, url) !== null;
-      const article = repo.saveArticle(userId, extracted, { url, source, tags, title, captureError });
-      return c.json(article, existed ? 200 : 201);
-    },
-  );
+    // Synchronous from here: existence check and upsert cannot interleave with another request.
+    const existed = repo.findArticleByUrl(userId, url) !== null;
+    const article = repo.saveArticle(userId, extracted, { url, source, tags, title, captureError });
+    return c.json(article, existed ? 200 : 201);
+  });
 
   r.get("/articles/:id", requireAuth, (c) => {
     const a = c.get("repo").getArticle(c.get("user").id, c.req.param("id"));

@@ -1,7 +1,15 @@
 import { Hono, type Context } from "hono";
 import { deleteCookie, setCookie } from "hono/cookie";
 import { HTTPException } from "hono/http-exception";
-import { badRequest, clientIp, readJson, readToken, requireAuth, type AppEnv } from "../app.ts";
+import {
+  assertSameOrigin,
+  badRequest,
+  clientIp,
+  readJson,
+  readToken,
+  requireAuth,
+  type AppEnv,
+} from "../app.ts";
 import {
   hashPassword,
   MAX_PASSWORD,
@@ -40,10 +48,14 @@ export function authRoutes(): Hono<AppEnv> {
   const r = new Hono<AppEnv>();
 
   r.post("/auth/signup", async (c) => {
+    // Sets a session cookie, so browser requests must be same-origin (blocks login CSRF).
+    assertSameOrigin(c, false);
     const repo = c.get("repo");
     const { config } = c.get("deps");
     const { email, password } = readCredentials(await readJson(c));
     if (password.length < MIN_PASSWORD) badRequest(`password must be at least ${MIN_PASSWORD} characters`);
+    if (!c.get("limiters").signup.attempt(clientIp(c)))
+      throw new HTTPException(429, { message: "too many signup attempts; try again later" });
     // Cheap pre-check so a closed instance does not burn scrypt CPU; re-checked after hashing.
     if (!config.signups && repo.countUsers() > 0)
       throw new HTTPException(403, { message: "signups are disabled" });
@@ -60,20 +72,19 @@ export function authRoutes(): Hono<AppEnv> {
   });
 
   r.post("/auth/login", async (c) => {
+    assertSameOrigin(c, false);
     const repo = c.get("repo");
-    const limiter = c.get("limiter");
+    const limiter = c.get("limiters").login;
     const { email, password } = readCredentials(await readJson(c));
-    const ip = clientIp(c);
-    if (limiter.blocked(ip, email))
+    const key = `${clientIp(c)}\u0000${email}`;
+    // Reserve the attempt before the (async) scrypt so concurrent guesses cannot exceed the limit.
+    if (!limiter.attempt(key))
       throw new HTTPException(429, { message: "too many login attempts; try again later" });
     const user = repo.getUserByEmail(email);
     const hash = user ? repo.getPasswordHash(user.id) : null;
     const ok = user && hash ? await verifyPassword(password, hash) : await verifyDummy(password);
-    if (!ok || !user) {
-      limiter.fail(ip, email);
-      throw new HTTPException(401, { message: "invalid email or password" });
-    }
-    limiter.reset(ip, email);
+    if (!ok || !user) throw new HTTPException(401, { message: "invalid email or password" });
+    limiter.refund(key);
     repo.pruneSessions();
     const token = repo.createSession(user.id, "session");
     setSessionCookie(c, token);
@@ -82,6 +93,7 @@ export function authRoutes(): Hono<AppEnv> {
 
   r.post("/auth/logout", (c) => {
     const cred = readToken(c);
+    assertSameOrigin(c, cred?.via === "cookie");
     // Only revoke browser sessions here; API tokens are long-lived credentials and are not revoked by logout.
     if (cred) {
       const repo = c.get("repo");
@@ -114,6 +126,8 @@ export function authRoutes(): Hono<AppEnv> {
     const body = await readJson(c);
     const label = typeof body.label === "string" ? body.label.trim().slice(0, 100) : "";
     if (!label) badRequest("label is required");
+    if (!c.get("limiters").tokens.attempt(clientIp(c)))
+      throw new HTTPException(429, { message: "too many tokens created; try again later" });
     const token = c.get("repo").createSession(c.get("user").id, "api", label);
     return c.json({ token }, 201);
   });

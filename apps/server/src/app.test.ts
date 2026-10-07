@@ -2,8 +2,9 @@ import { describe, it, expect, beforeEach } from "vitest";
 import type { Article, Extracted, Highlight, User } from "@later/core";
 import { createApp, type AppConfig, type Extractor } from "./app.ts";
 import { openDb } from "./db.ts";
-import { hashPassword, verifyPassword, LoginLimiter } from "./auth.ts";
+import { hashPassword, verifyPassword, RateLimiter } from "./auth.ts";
 import { ftsQuery } from "./repo.ts";
+import { normalizeUrl } from "./routes/articles.ts";
 
 type App = ReturnType<typeof createApp>;
 
@@ -122,7 +123,11 @@ describe("auth", () => {
     expect(me.status).toBe(200);
 
     expect(
-      (await call("POST", "/api/auth/logout", { headers: { cookie: `later_session=${cookieVal}` } })).status,
+      (
+        await call("POST", "/api/auth/logout", {
+          headers: { cookie: `later_session=${cookieVal}`, origin: "http://localhost:4800" },
+        })
+      ).status,
     ).toBe(204);
     expect((await call("GET", "/api/me", { headers: { cookie: `later_session=${cookieVal}` } })).status).toBe(
       401,
@@ -253,6 +258,41 @@ describe("auth", () => {
       body: { url: "https://a.com/x" },
     });
     expect(evil.status).toBe(403);
+    // neither Origin nor Sec-Fetch-Site on a cookie-authenticated write -> rejected
+    expect(
+      (await call("POST", "/api/articles", { headers: { cookie }, body: { url: "https://a.com/x" } })).status,
+    ).toBe(403);
+    expect((await call("DELETE", "/api/articles/whatever", { headers: { cookie } })).status).toBe(403);
+    expect(
+      (
+        await call("POST", "/api/articles", {
+          headers: { cookie, "sec-fetch-site": "cross-site" },
+          body: { url: "https://a.com/x" },
+        })
+      ).status,
+    ).toBe(403);
+    expect(
+      (
+        await call("POST", "/api/articles", {
+          headers: { cookie, "sec-fetch-site": "same-site" },
+          body: { url: "https://a.com/x" },
+        })
+      ).status,
+    ).toBe(403);
+    // cookie GETs need no origin signal
+    expect((await call("GET", "/api/me", { headers: { cookie } })).status).toBe(200);
+    // logout via cookie is guarded too (session survives a forged logout)
+    expect((await call("POST", "/api/auth/logout", { headers: { cookie } })).status).toBe(403);
+    expect(
+      (await call("POST", "/api/auth/logout", { headers: { cookie, origin: "https://evil.example" } }))
+        .status,
+    ).toBe(403);
+    expect((await call("GET", "/api/me", { headers: { cookie } })).status).toBe(200);
+    const sfs = await call("POST", "/api/articles", {
+      headers: { cookie, "sec-fetch-site": "same-origin" },
+      body: { url: "https://a.com/z" },
+    });
+    expect(sfs.status).toBe(201);
     const ok = await call("POST", "/api/articles", {
       headers: { cookie, origin: "http://localhost:4800" },
       body: { url: "https://a.com/x" },
@@ -265,6 +305,116 @@ describe("auth", () => {
     });
     expect(bearer.status).toBe(201);
   });
+
+  it("blocks login/signup CSRF: foreign origin and non-JSON content types", async () => {
+    await signup("a@x.io");
+    const creds = JSON.stringify({ email: "a@x.io", password: "password123" });
+    for (const path of ["/api/auth/login", "/api/auth/signup"]) {
+      const evil = await call("POST", path, {
+        headers: { origin: "https://evil.example" },
+        body: { email: "z@x.io", password: "password123" },
+      });
+      expect(evil.status, path).toBe(403);
+      const cross = await call("POST", path, {
+        headers: { "sec-fetch-site": "cross-site" },
+        body: { email: "z@x.io", password: "password123" },
+      });
+      expect(cross.status, path).toBe(403);
+    }
+    for (const ct of ["text/plain", "application/x-www-form-urlencoded", "multipart/form-data; boundary=x"]) {
+      const r = await app.request("/api/auth/login", {
+        method: "POST",
+        headers: { "content-type": ct },
+        body: creds,
+      });
+      expect(r.status, ct).toBe(415);
+      expect(r.headers.get("set-cookie")).toBeNull();
+    }
+    const noCt = await app.request("/api/auth/login", { method: "POST", body: creds });
+    expect(noCt.status).toBe(415);
+    // same-origin browser login and header-less (non-browser) clients still work
+    const same = await call("POST", "/api/auth/login", {
+      headers: { origin: "http://localhost:4800", "sec-fetch-site": "same-origin" },
+      body: { email: "a@x.io", password: "password123" },
+    });
+    expect(same.status).toBe(200);
+    const withCharset = await app.request("/api/auth/login", {
+      method: "POST",
+      headers: { "content-type": "application/json; charset=utf-8" },
+      body: creds,
+    });
+    expect(withCharset.status).toBe(200);
+    // JSON content type is required on authed JSON routes too
+    const tok = same.json.token;
+    const patch = await app.request("/api/me", {
+      method: "PATCH",
+      headers: { authorization: `Bearer ${tok}`, "content-type": "text/plain" },
+      body: JSON.stringify({ kindleEmail: null }),
+    });
+    expect(patch.status).toBe(415);
+  });
+
+  it("concurrent wrong-password logins cannot exceed the limit", async () => {
+    await signup("a@x.io");
+    const rs = await Promise.all(
+      Array.from({ length: 24 }, (_, i) =>
+        call("POST", "/api/auth/login", { body: { email: "a@x.io", password: `wrongpass${i}` } }),
+      ),
+    );
+    expect(rs.filter((r) => r.status === 401)).toHaveLength(10);
+    expect(rs.filter((r) => r.status === 429)).toHaveLength(14);
+  }, 20_000);
+
+  it("successful logins are refunded", async () => {
+    await signup("a@x.io");
+    for (let i = 0; i < 15; i++) {
+      expect(
+        (await call("POST", "/api/auth/login", { body: { email: "a@x.io", password: "password123" } }))
+          .status,
+      ).toBe(200);
+    }
+  }, 20_000);
+
+  it("rate limits signups and token creation per IP", async () => {
+    const first = await signup("u0@x.io");
+    const rs = await Promise.all(
+      Array.from({ length: 12 }, (_, i) =>
+        call("POST", "/api/auth/signup", { body: { email: `u${i + 1}@x.io`, password: "password123" } }),
+      ),
+    );
+    expect(rs.filter((r) => r.status === 201)).toHaveLength(9);
+    expect(rs.filter((r) => r.status === 429)).toHaveLength(3);
+
+    const ts = await Promise.all(
+      Array.from({ length: 22 }, (_, i) =>
+        call("POST", "/api/tokens", { token: first.token, body: { label: `t${i}` } }),
+      ),
+    );
+    expect(ts.filter((r) => r.status === 201)).toHaveLength(20);
+    expect(ts.filter((r) => r.status === 429)).toHaveLength(2);
+  }, 20_000);
+
+  it("body size limits: 1 MB default, 20 MB for POST /api/articles", async () => {
+    const s = await signup("a@x.io");
+    const big = "x".repeat(2 * 1024 * 1024);
+    const r1 = await call("PATCH", "/api/me", { token: s.token, body: { kindleEmail: null, pad: big } });
+    expect(r1.status).toBe(413);
+    const r2 = await call("POST", "/api/auth/login", {
+      body: { email: "a@x.io", password: "password123", pad: big },
+    });
+    expect(r2.status).toBe(413);
+    const r3 = await call("POST", "/api/articles", {
+      token: s.token,
+      body: { url: "https://e.com/big", html: `<p>${big}</p>` },
+    });
+    expect(r3.status).toBe(201);
+    const huge = "x".repeat(21 * 1024 * 1024);
+    const r4 = await call("POST", "/api/articles", {
+      token: s.token,
+      body: { url: "https://e.com/huge", html: huge },
+    });
+    expect(r4.status).toBe(413);
+  }, 20_000);
 });
 
 describe("password hashing", () => {
@@ -277,13 +427,16 @@ describe("password hashing", () => {
     expect(await verifyPassword("x", "scrypt$99999999$8$1$aa$bb")).toBe(false);
   });
 
-  it("limiter window resets", () => {
-    const l = new LoginLimiter(2, 1000);
-    l.fail("ip", "e", 0);
-    l.fail("ip", "e", 1);
-    expect(l.blocked("ip", "e", 2)).toBe(true);
-    expect(l.blocked("ip2", "e", 2)).toBe(false);
-    expect(l.blocked("ip", "e", 1001)).toBe(false);
+  it("limiter reserves, refunds and resets per window", () => {
+    const l = new RateLimiter(2, 1000);
+    expect(l.attempt("k", 0)).toBe(true);
+    expect(l.attempt("k", 1)).toBe(true);
+    expect(l.attempt("k", 2)).toBe(false);
+    expect(l.attempt("other", 2)).toBe(true);
+    l.refund("k", 3);
+    expect(l.attempt("k", 4)).toBe(true);
+    expect(l.attempt("k", 5)).toBe(false);
+    expect(l.attempt("k", 1001)).toBe(true);
   });
 });
 
@@ -486,6 +639,14 @@ describe("articles", () => {
     expect(snip).toContain("<mark>keyword</mark>");
     expect(snip).not.toContain("<img");
     expect(snip).toContain("&lt;img");
+  });
+
+  it("rejects URLs with credentials", async () => {
+    expect((await save(tok, { url: "https://user:pass@e.com/x" })).status).toBe(400);
+    expect((await save(tok, { url: "https://user@e.com/x" })).status).toBe(400);
+    expect(normalizeUrl("https://:p@e.com/")).toBeNull();
+    expect(normalizeUrl("https://e.com/a#b")).toBe("https://e.com/a");
+    expect(ex.fetchCalls).toHaveLength(0);
   });
 
   it("ftsQuery sanitizes", () => {

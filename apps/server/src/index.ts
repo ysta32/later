@@ -5,6 +5,7 @@ import { serve } from "@hono/node-server";
 import { serveStatic } from "@hono/node-server/serve-static";
 import { createApp, type Extractor } from "./app.ts";
 import { openDb } from "./db.ts";
+import { extractFromHtml, fetchAndExtract } from "@later/core/extract";
 
 const env = process.env;
 const port = Number(env.PORT ?? 4800);
@@ -15,31 +16,18 @@ if (signupsRaw !== "on" && signupsRaw !== "off")
   throw new Error(`LATER_SIGNUPS must be "on" or "off", got "${env.LATER_SIGNUPS}"`);
 const publicUrl = (env.LATER_PUBLIC_URL || `http://localhost:${port}`).replace(/\/+$/, "");
 
-// Real extractor from @later/core. The specifier is held in a variable so this file type-checks
-// even before core/extract.ts lands; only a missing module is tolerated (logged loudly).
-const EXTRACT_MODULE: string = "@later/core/extract";
-async function loadExtractor(): Promise<Extractor> {
-  try {
-    const mod = (await import(EXTRACT_MODULE)) as Partial<Extractor>;
-    if (typeof mod.fetchAndExtract !== "function" || typeof mod.extractFromHtml !== "function") {
-      throw new Error(`${EXTRACT_MODULE} does not export fetchAndExtract/extractFromHtml`);
-    }
-    return { fetchAndExtract: mod.fetchAndExtract, extractFromHtml: mod.extractFromHtml };
-  } catch (err) {
-    const code = (err as { code?: string }).code;
-    if (code !== "ERR_MODULE_NOT_FOUND" || !String((err as Error).message).includes("extract")) throw err;
-    console.error(`[later] WARNING: ${EXTRACT_MODULE} not found; article capture will be saved as failed.`);
-    const unavailable = (): never => {
-      throw new Error("extractor unavailable on this server");
-    };
-    return { fetchAndExtract: async () => unavailable(), extractFromHtml: () => unavailable() };
-  }
-}
+// Real extractor (static import: startup fails if it is unavailable).
+// Private/loopback targets are refused by the extractor unless LATER_ALLOW_PRIVATE_FETCH=1.
+const allowPrivate = env.LATER_ALLOW_PRIVATE_FETCH === "1";
+const extractor: Extractor = {
+  fetchAndExtract: (url) => fetchAndExtract(url, { allowPrivate }),
+  extractFromHtml: (html, url) => extractFromHtml(html, url),
+};
 
 const db = openDb(dataDir);
 const app = createApp({
   db,
-  extract: await loadExtractor(),
+  extract: extractor,
   config: {
     dataDir,
     signups: signupsRaw === "on",
