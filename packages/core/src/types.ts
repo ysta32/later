@@ -2,33 +2,33 @@
 
 export type ArticleState = "inbox" | "archived";
 export type CaptureSource =
-  | "server"      // server-side fetch + readability
-  | "extension"   // rendered DOM from the user's browser session
+  | "server" // server-side fetch + readability
+  | "extension" // rendered DOM from the user's browser session
   | "bookmarklet"
-  | "share"       // PWA share target
-  | "email"       // email-in address
-  | "rss"         // feed / newsletter
+  | "share" // PWA share target
+  | "email" // email-in address
+  | "rss" // feed / newsletter
   | "import"
   | "api";
 
 export interface Article {
-  id: string;            // ulid-ish, from newId()
+  id: string; // ulid-ish, from newId()
   userId: string;
-  url: string;           // canonical URL ("" allowed for email newsletters)
+  url: string; // canonical URL ("" allowed for email newsletters)
   title: string;
   author: string | null;
   siteName: string | null;
   excerpt: string | null;
-  contentHtml: string;   // sanitized readable HTML ("" if capture pending/failed)
-  textContent: string;   // plain text for search/TTS/AI
+  contentHtml: string; // sanitized readable HTML ("" if capture pending/failed)
+  textContent: string; // plain text for search/TTS/AI
   wordCount: number;
   leadImage: string | null;
   publishedAt: string | null; // ISO
-  savedAt: string;       // ISO
-  updatedAt: string;     // ISO
+  savedAt: string; // ISO
+  updatedAt: string; // ISO
   state: ArticleState;
   favorite: boolean;
-  progress: number;      // 0..1 scroll progress
+  progress: number; // 0..1 scroll progress
   source: CaptureSource;
   captureStatus: "ok" | "pending" | "failed";
   captureError: string | null;
@@ -40,9 +40,9 @@ export interface Highlight {
   id: string;
   articleId: string;
   userId: string;
-  quote: string;         // exact selected text
-  prefix: string;        // up to 32 chars before (for re-anchoring)
-  suffix: string;        // up to 32 chars after
+  quote: string; // exact selected text
+  prefix: string; // up to 32 chars before (for re-anchoring)
+  suffix: string; // up to 32 chars after
   note: string | null;
   color: "yellow" | "green" | "blue" | "pink";
   createdAt: string;
@@ -62,7 +62,7 @@ export interface User {
   id: string;
   email: string;
   createdAt: string;
-  inboundToken: string;  // email-in local part: save+<token>@<domain>
+  inboundToken: string; // email-in local part: save+<token>@<domain>
   kindleEmail: string | null;
 }
 
@@ -73,7 +73,7 @@ export interface Extracted {
   author: string | null;
   siteName: string | null;
   excerpt: string | null;
-  contentHtml: string;   // sanitized
+  contentHtml: string; // sanitized
   textContent: string;
   wordCount: number;
   leadImage: string | null;
@@ -85,7 +85,7 @@ export interface ImportItem {
   url: string;
   title: string | null;
   tags: string[];
-  savedAt: string | null;     // ISO
+  savedAt: string | null; // ISO
   state: ArticleState;
   favorite: boolean;
   highlights: { quote: string; note: string | null; createdAt: string | null }[];
