@@ -1,7 +1,14 @@
 import { useEffect, useState } from "preact/hooks";
 import { api, ApiError } from "./api.ts";
 import type { User } from "./api.ts";
-import { cacheInbox, setOfflineUser } from "./offline.ts";
+import {
+  cacheInbox,
+  clearOffline,
+  clearOtherOfflineUsers,
+  getOfflineArticle,
+  replayOffline,
+  setOfflineUser,
+} from "./offline.ts";
 import Library from "./pages/Library.tsx";
 import Settings from "./pages/Settings.tsx";
 import Ask from "./pages/Ask.tsx";
@@ -54,7 +61,7 @@ function storedUser(): User | null {
     return null;
   }
 }
-function Auth({ onLogin }: { onLogin: (user: User) => void }) {
+function Auth({ onLogin }: { onLogin: (user: User) => Promise<void> }) {
   const [signup, setSignup] = useState(false);
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -77,7 +84,7 @@ function Auth({ onLogin }: { onLogin: (user: User) => void }) {
           setBusy(true);
           setError("");
           try {
-            onLogin((await (signup ? api.signup(email, password) : api.login(email, password))).user);
+            await onLogin((await (signup ? api.signup(email, password) : api.login(email, password))).user);
           } catch (error) {
             setError(errorMessage(error));
           } finally {
@@ -131,7 +138,13 @@ export default function App() {
   const [error, setError] = useState("");
   const [online, setOnline] = useState(navigator.onLine);
   const [theme, setTheme] = useState(() => localStorage.getItem("later-theme") ?? "system");
-  const acceptUser = (value: User) => {
+  const acceptUser = async (value: User) => {
+    try {
+      await clearOtherOfflineUsers(value.id);
+    } catch (error) {
+      setError(errorMessage(error));
+      return;
+    }
     localStorage.setItem("later-user", JSON.stringify(value));
     setOfflineUser(value.id);
     setUser(value);
@@ -142,13 +155,21 @@ export default function App() {
     void api
       .me()
       .then(({ user }) => acceptUser(user))
-      .catch((error) => {
+      .catch(async (error) => {
         if (!(error instanceof ApiError)) {
           const cached = storedUser();
-          if (cached) acceptUser(cached);
+          if (cached) await acceptUser(cached);
         } else if (error.status === 401) {
+          const cached = storedUser();
           localStorage.removeItem("later-user");
           setOfflineUser(null);
+          if (cached) {
+            try {
+              await clearOffline(cached.id);
+            } catch (error) {
+              setError(errorMessage(error));
+            }
+          }
         } else setError(errorMessage(error));
       })
       .finally(() => setLoading(false));
@@ -224,11 +245,16 @@ export default function App() {
             class="text-button"
             onClick={async () => {
               try {
+                await replayOffline().catch(() => undefined);
                 await api.logout();
-                localStorage.removeItem("later-user");
-                setOfflineUser(null);
-                setUser(null);
-                location.hash = "/";
+                try {
+                  await clearOffline(user.id);
+                } finally {
+                  localStorage.removeItem("later-user");
+                  setOfflineUser(null);
+                  setUser(null);
+                  location.hash = "/";
+                }
               } catch (error) {
                 setError(errorMessage(error));
               }
@@ -258,6 +284,7 @@ export default function App() {
         ) : route.page === "read" ? (
           <Reader
             id={route.value!}
+            loadOffline={(id: string) => getOfflineArticle(id).then((article) => article ?? null)}
             onClose={() => {
               location.hash = "/";
             }}

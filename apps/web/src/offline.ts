@@ -13,23 +13,31 @@ export interface QueueStorage {
 
 export function createOfflineQueue(storage: QueueStorage) {
   let tail: Promise<unknown> = Promise.resolve();
+  let cleared = false;
   const serial = <T>(operation: () => Promise<T>): Promise<T> => {
     const result = tail.then(operation);
     tail = result.catch(() => undefined);
     return result;
   };
   return {
+    clear: (remove: () => Promise<void>) => {
+      cleared = true;
+      return serial(remove);
+    },
     enqueue: (id: string, patch: OfflinePatch) =>
       serial(async () => {
+        if (cleared) return;
         const items = await storage.read();
         await storage.write([...items, { id, patch }]);
       }),
     replay: (send: (id: string, patch: OfflinePatch) => Promise<unknown>) =>
       serial(async () => {
+        if (cleared) return;
         const items = await storage.read();
-        while (items.length) {
+        while (items.length && !cleared) {
           const item = items[0]!;
           await send(item.id, item.patch);
+          if (cleared) return;
           items.shift();
           await storage.write([...items]);
         }
@@ -82,6 +90,39 @@ function queue(userId: string) {
   }
   return value;
 }
+export async function clearOffline(userId: string): Promise<void> {
+  if (owner === userId) owner = null;
+  const pending = queues.get(userId);
+  const remove = async () => {
+    const database = await db();
+    await new Promise<void>((resolve, reject) => {
+      const tx = database.transaction("data", "readwrite");
+      const data = tx.objectStore("data");
+      data.delete(`${userId}:articles`);
+      data.delete(`${userId}:queue`);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error ?? new Error("Offline storage was interrupted"));
+    });
+    queues.delete(userId);
+  };
+  await (pending ? pending.clear(remove) : remove());
+}
+export async function clearOtherOfflineUsers(userId: string): Promise<void> {
+  const database = await db();
+  const keys = await new Promise<IDBValidKey[]>((resolve, reject) => {
+    const request = database.transaction("data").objectStore("data").getAllKeys();
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+  const users = new Set(queues.keys());
+  if (owner) users.add(owner);
+  for (const key of keys) {
+    if (typeof key === "string" && /:(articles|queue)$/.test(key))
+      users.add(key.replace(/:(articles|queue)$/, ""));
+  }
+  await Promise.all([...users].filter((id) => id !== userId).map(clearOffline));
+}
 export function setOfflineUser(userId: string | null): void {
   owner = userId;
 }
@@ -109,6 +150,7 @@ export async function replayOffline(): Promise<void> {
     try {
       const updated = await api.update(id, patch);
       const articles = (await read<Article[]>(`${userId}:articles`)) ?? [];
+      if (owner !== userId) return;
       await write(
         `${userId}:articles`,
         articles.map((article) => (article.id === id ? updated : article)),

@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createOfflineQueue } from "./offline.ts";
 import type { PendingPatch, QueueStorage } from "./offline.ts";
 function memory(initial: PendingPatch[] = []): QueueStorage {
@@ -71,6 +71,35 @@ describe("offline mutation queue", () => {
     expect(sent).toEqual(["a", "b"]);
     expect(await storage.read()).toEqual([]);
   });
+  it("waits for an in-flight replay before clearing and stops remaining sends", async () => {
+    const storage = memory([
+      { id: "a", patch: {} },
+      { id: "b", patch: {} },
+    ]);
+    const queue = createOfflineQueue(storage);
+    let release!: () => void;
+    let started!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const sending = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    const sent: string[] = [];
+    const replay = queue.replay(async (id) => {
+      sent.push(id);
+      started();
+      await gate;
+    });
+    await sending;
+    const clear = queue.clear(() => storage.write([]));
+    release();
+    await Promise.all([replay, clear]);
+    await queue.enqueue("c", {});
+    expect(sent).toEqual(["a"]);
+    expect(await storage.read()).toEqual([]);
+  });
+
   it("surfaces persistence failures and recovers for later operations", async () => {
     const storage = memory();
     let fail = true;
@@ -85,5 +114,83 @@ describe("offline mutation queue", () => {
     fail = false;
     await queue.enqueue("b", { progress: 0.6 });
     expect(await storage.read()).toEqual([{ id: "b", patch: { progress: 0.6 } }]);
+  });
+});
+
+describe("offline account cleanup", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  async function setup() {
+    vi.resetModules();
+    const values = new Map<string, unknown>();
+    const database = {
+      transaction: () => {
+        const tx = {
+          oncomplete: () => {},
+          objectStore: () => ({
+            get(key: string) {
+              const request = { result: structuredClone(values.get(key)), onsuccess: () => {} };
+              queueMicrotask(() => request.onsuccess());
+              return request;
+            },
+            getAllKeys() {
+              const request = { result: [...values.keys()], onsuccess: () => {} };
+              queueMicrotask(() => request.onsuccess());
+              return request;
+            },
+            put(value: unknown, key: string) {
+              values.set(key, structuredClone(value));
+            },
+            delete(key: string) {
+              values.delete(key);
+            },
+          }),
+        };
+        queueMicrotask(() => tx.oncomplete());
+        return tx;
+      },
+    };
+    vi.stubGlobal("indexedDB", {
+      open() {
+        const request = { result: database, onsuccess: () => {} };
+        queueMicrotask(() => request.onsuccess());
+        return request;
+      },
+    });
+    return { values, offline: await import("./offline.ts") };
+  }
+
+  it("deletes only the signed-out account and allows a fresh queue on later login", async () => {
+    const { values, offline } = await setup();
+    values.set("alice:articles", [{ id: "a" }]);
+    values.set("bob:articles", [{ id: "b" }]);
+    offline.setOfflineUser("alice");
+    await offline.queuePatch("a", { favorite: true });
+    await offline.clearOffline("alice");
+    expect(values.has("alice:articles")).toBe(false);
+    expect(values.has("alice:queue")).toBe(false);
+    expect(values.get("bob:articles")).toEqual([{ id: "b" }]);
+    expect(await offline.listOffline()).toEqual([]);
+    await expect(offline.queuePatch("a", {})).rejects.toThrow("Sign in");
+    offline.setOfflineUser("alice");
+    await offline.queuePatch("new", { progress: 0.5 });
+    expect(values.get("alice:queue")).toEqual([{ id: "new", patch: { progress: 0.5 } }]);
+  });
+
+  it("removes all other persisted accounts while retaining the accepted account", async () => {
+    const { values, offline } = await setup();
+    for (const id of ["alice", "bob", "carol"]) {
+      values.set(`${id}:articles`, []);
+      values.set(`${id}:queue`, []);
+    }
+    await offline.clearOtherOfflineUsers("bob");
+    expect([...values.keys()].sort()).toEqual(["bob:articles", "bob:queue"]);
+  });
+
+  it("does not resurrect a queue when clearing races with an enqueue", async () => {
+    const { values, offline } = await setup();
+    offline.setOfflineUser("alice");
+    await Promise.all([offline.queuePatch("a", { favorite: true }), offline.clearOffline("alice")]);
+    expect(values.has("alice:queue")).toBe(false);
   });
 });
