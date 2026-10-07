@@ -171,3 +171,4 @@ opsz woff2 latin only, `font-display: swap` with metric fallbacks, so CLS stays 
 ## Progress log
 - 2026-10-07 17:50 — Direction set: "Marginalia" (warm paper, ink, one proofreader's red pencil). Literata / Instrument Sans / JetBrains Mono. Tokens in packages/design.
 - 2026-10-07 17:55 — "Before" screenshots of the v0 site captured in docs/screenshots/before/site (functional, pre-design-system).
+- 2026-10-07 18:20 — App 'before' shots in docs/screenshots/before/app (functional, generic). R1 shell, R2 reader, R3 site restyles in flight.
